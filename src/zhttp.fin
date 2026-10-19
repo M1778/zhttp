@@ -1,0 +1,1073 @@
+// zhttp — HTTP/1.1 client and server for Fin.
+//
+// A small, dependency-free HTTP library: URL parsing, a blocking HTTP client
+// (GET/POST), and a blocking HTTP server (accept, read request, write
+// response). Transport is raw TCP over IPv4, mirroring the design of
+// `networking::std` (blocking sockets, dotted-quad addresses, `blame` for
+// programmer errors, explicit error values for I/O failures).
+//
+// Why the socket layer is vendored here instead of imported from
+// networking::std: only `#[global]` externs lower through a module-qualified
+// call, and networking.fin's `c_*` externs are not `#[global]`, so importing
+// them is refused in the frontend (see docs/guide/10-modules-and-imports.md).
+// The @defines below carry the exact same C ABI as networking.fin's.
+
+import { Collection } from collection::std;
+import { len, equals, clone, substr, trim, find, to_chars, from_chars, free_str } from strings::std;
+
+namespace fin {
+
+// ---------------------------------------------------------------------------
+// Local C bindings (module-private). Same ABI as networking::std.
+// ---------------------------------------------------------------------------
+
+#[llvm_name="socket"]
+@define z_socket(domain: int, kind: int, protocol: int) <int>;
+
+#[llvm_name="connect"]
+@define z_connect(fd: int, addr: &int, len: int) <int>;
+
+#[llvm_name="bind"]
+@define z_bind(fd: int, addr: &int, len: int) <int>;
+
+#[llvm_name="listen"]
+@define z_listen(fd: int, backlog: int) <int>;
+
+#[llvm_name="accept"]
+@define z_accept(fd: int, addr: &int, len: &int) <int>;
+
+#[llvm_name="getsockname"]
+@define z_getsockname(fd: int, addr: &int, len: &int) <int>;
+
+#[llvm_name="send"]
+@define z_send(fd: int, buf: &char, len: int, flags: int) <int>;
+
+#[llvm_name="recv"]
+@define z_recv(fd: int, buf: &char, len: int, flags: int) <int>;
+
+#[llvm_name="close"]
+@define z_close(fd: int) <int>;
+
+#[llvm_name="inet_addr"]
+@define z_inet_addr(cp: string) <int>;
+
+#[llvm_name="calloc"]
+@define z_calloc(count: ulong, size: ulong) <string>;
+
+#[llvm_name="free"]
+@define z_cfree(p: string) <noret>;
+
+#[llvm_name="snprintf"]
+@define z_snprintf(buf: string, size: ulong, fmt: string, ...) <int>;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+// Header set: parallel collections (names[i] belongs to values[i]).
+// A Collection<HttpHeader> struct element would need struct ==, which the
+// backend refuses to lower — hence this shape.
+#[export]
+pub struct HttpHeaders {
+    pub:
+        names <&Collection<string>>,
+        values <&Collection<string>>,
+}
+
+#[export]
+pub struct HttpRequest {
+    pub:
+        method <string>,
+        target <string>,
+        version <string>,
+        headers <&HttpHeaders>,
+        body <string>,
+}
+
+#[export]
+pub struct HttpResponse {
+    pub:
+        status <int>,
+        headers <&HttpHeaders>,
+        body <string>,
+}
+
+#[export]
+pub struct HttpUrl {
+    pub:
+        scheme <string>,
+        host <string>,
+        port <int>,
+        path <string>,
+        query <string>,
+}
+
+#[export]
+pub struct HttpUrlResult {
+    pub:
+        ok <bool>,
+        url <HttpUrl>,
+        err <string>,
+}
+
+#[export]
+pub struct HttpResult {
+    pub:
+        ok <bool>,
+        status <int>,
+        headers <&HttpHeaders>,
+        body <string>,
+        err <string>,
+}
+
+#[export]
+pub struct HttpReadResult {
+    pub:
+        ok <bool>,
+        req <&HttpRequest>,
+        err <string>,
+}
+
+#[export]
+pub struct HttpServer {
+    pub:
+        fd <int>,
+}
+
+#[export]
+pub struct HttpConn {
+    pub:
+        fd <int>,
+}
+
+// ---------------------------------------------------------------------------
+// Internal: growable byte buffer
+// ---------------------------------------------------------------------------
+
+struct ZBuf {
+    data <[char]>,
+    len <int>,
+    cap <int>,
+}
+
+fun z_buf_new() <&ZBuf> {
+    let cap <int> = 4096;
+    return new ZBuf{data: new [char, cap]{}, len: 0, cap: cap};
+}
+
+fun z_buf_reserve(b: &ZBuf, extra: int) <noret> {
+    if (b.len + extra <= b.cap) { return; }
+    let want <int> = b.cap * 2;
+    while (want < b.len + extra) { want = want * 2; }
+    let nd <[char]> = new [char, want]{};
+    for (let i <int> = 0; i < b.len; i++) { nd[i] = b.data[i]; }
+    delete b.data;
+    b.data = nd;
+    b.cap = want;
+}
+
+fun z_buf_push(b: &ZBuf, c: char) <noret> {
+    z_buf_reserve(b, 1);
+    b.data[b.len] = c;
+    b.len = b.len + 1;
+}
+
+fun z_buf_append(b: &ZBuf, bytes: [char], n: int) <noret> {
+    if (n <= 0) { return; }
+    z_buf_reserve(b, n);
+    for (let i <int> = 0; i < n; i++) { b.data[b.len + i] = bytes[i]; }
+    b.len = b.len + n;
+}
+
+fun z_buf_append_str(b: &ZBuf, s: string) <noret> {
+    let m <int> = len(s);
+    if (m == 0) { return; }
+    z_buf_reserve(b, m);
+    let bytes <[char]> = to_chars(s);
+    for (let i <int> = 0; i < m; i++) { b.data[b.len + i] = bytes[i]; }
+    b.len = b.len + m;
+    delete bytes;
+}
+
+fun z_buf_to_string(b: &ZBuf) <string> {
+    return from_chars(b.data, 0, b.len);
+}
+
+fun z_buf_free(b: &ZBuf) <noret> {
+    delete b.data;
+    delete b;
+}
+
+// Finds "\r\n\r\n" in the buffer; returns its start index or -1.
+fun z_find_headers_end(b: &ZBuf) <int> {
+    let i <int> = 0;
+    while (i + 4 <= b.len) {
+        if (b.data[i] == '\r' && b.data[i + 1] == '\n' && b.data[i + 2] == '\r' && b.data[i + 3] == '\n') {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Internal: small helpers
+// ---------------------------------------------------------------------------
+
+fun z_lower_char(c: char) <char> {
+    if (c >= 'A' && c <= 'Z') { return cast<char>(cast<int>(c) + 32); }
+    return c;
+}
+
+fun z_name_eq(a: string, b: string) <bool> {
+    if (len(a) != len(b)) { return false; }
+    let ab <[char]> = to_chars(a);
+    let bb <[char]> = to_chars(b);
+    let n <int> = len(a);
+    let same <bool> = true;
+    for (let i <int> = 0; i < n; i++) {
+        if (z_lower_char(ab[i]) != z_lower_char(bb[i])) {
+            same = false;
+            break;
+        }
+    }
+    delete ab;
+    delete bb;
+    return same;
+}
+
+// Non-blaming unsigned parse; -1 on any invalid input or overflow past 65535.
+fun z_parse_uint(text: string) <int> {
+    let bytes <[char]> = to_chars(text);
+    let n <int> = len(text);
+    if (n == 0) { delete bytes; return -1; }
+    let acc <int> = 0;
+    for (let i <int> = 0; i < n; i++) {
+        let c <char> = bytes[i];
+        if (c < '0' || c > '9') { delete bytes; return -1; }
+        acc = acc * 10 + (cast<int>(c) - cast<int>('0'));
+        if (acc > 65535) { delete bytes; return -1; }
+    }
+    delete bytes;
+    return acc;
+}
+
+// Hex parse for chunk sizes; -1 on invalid.
+fun z_parse_hex(text: string) <int> {
+    let bytes <[char]> = to_chars(text);
+    let n <int> = len(text);
+    if (n == 0) { delete bytes; return -1; }
+    let acc <int> = 0;
+    for (let i <int> = 0; i < n; i++) {
+        let c <char> = bytes[i];
+        let d <int> = -1;
+        if (c >= '0' && c <= '9') { d = cast<int>(c) - cast<int>('0'); }
+        else if (c >= 'a' && c <= 'f') { d = cast<int>(c) - cast<int>('a') + 10; }
+        else if (c >= 'A' && c <= 'F') { d = cast<int>(c) - cast<int>('A') + 10; }
+        if (d < 0) { delete bytes; return -1; }
+        acc = acc * 16 + d;
+        if (acc > 16777216) { delete bytes; return -1; }
+    }
+    delete bytes;
+    return acc;
+}
+
+fun z_itoa(v: int) <string> {
+    let tmp <string> = z_calloc(cast<ulong>(24), cast<ulong>(1));
+    z_snprintf(tmp, cast<ulong>(24), "%d", v);
+    let out <string> = clone(tmp);
+    z_cfree(tmp);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// URL parsing
+// ---------------------------------------------------------------------------
+
+fun z_url_err(msg: string) <HttpUrlResult> {
+    return HttpUrlResult{ok: false,
+        url: HttpUrl{scheme: "", host: "", port: 0, path: "", query: ""},
+        err: clone(msg)};
+}
+
+#[export]
+pub fun http_parse_url(s: string) <HttpUrlResult> {
+    let scheme_end <int> = find(s, "://");
+    if (scheme_end < 0) { return z_url_err("missing scheme (expected http://host/...)"); }
+    let scheme <string> = substr(s, 0, scheme_end);
+    let scheme_lc <[char]> = to_chars(scheme);
+    let is_http <bool> = len(scheme) == 4;
+    if (is_http) {
+        if (!(z_lower_char(scheme_lc[0]) == 'h' && z_lower_char(scheme_lc[1]) == 't' &&
+              z_lower_char(scheme_lc[2]) == 't' && z_lower_char(scheme_lc[3]) == 'p')) {
+            is_http = false;
+        }
+    }
+    delete scheme_lc;
+    if (!is_http) {
+        free_str(scheme);
+        return z_url_err("unsupported scheme (only http:// in v0.1; no TLS)");
+    }
+    free_str(scheme);
+    let rest <string> = substr(s, scheme_end + 3, len(s) - scheme_end - 3);
+    let slash <int> = find(rest, "/");
+    let authority <string> = null;
+    let pathquery <string> = null;
+    if (slash < 0) {
+        authority = clone(rest);
+        pathquery = clone("/");
+    } else {
+        authority = substr(rest, 0, slash);
+        pathquery = substr(rest, slash, len(rest) - slash);
+    }
+    free_str(rest);
+    if (len(authority) == 0) {
+        free_str(authority);
+        free_str(pathquery);
+        return z_url_err("missing host");
+    }
+    let colon <int> = find(authority, ":");
+    let host <string> = null;
+    let port <int> = 80;
+    if (colon < 0) {
+        host = clone(authority);
+    } else {
+        host = substr(authority, 0, colon);
+        let porttext <string> = substr(authority, colon + 1, len(authority) - colon - 1);
+        port = z_parse_uint(porttext);
+        free_str(porttext);
+        if (port <= 0) {
+            free_str(authority);
+            free_str(pathquery);
+            free_str(host);
+            return z_url_err("invalid port");
+        }
+    }
+    free_str(authority);
+    let qmark <int> = find(pathquery, "?");
+    let path <string> = null;
+    let query <string> = null;
+    if (qmark < 0) {
+        path = clone(pathquery);
+        query = clone("");
+    } else {
+        path = substr(pathquery, 0, qmark);
+        query = substr(pathquery, qmark + 1, len(pathquery) - qmark - 1);
+    }
+    free_str(pathquery);
+    return HttpUrlResult{ok: true,
+        url: HttpUrl{scheme: clone("http"), host: host, port: port, path: path, query: query},
+        err: ""};
+}
+
+#[export]
+pub fun http_free_url_result(r: &HttpUrlResult) <noret> {
+    if (r.ok) {
+        free_str(r.url.scheme);
+        free_str(r.url.host);
+        free_str(r.url.path);
+        free_str(r.url.query);
+    } else {
+        free_str(r.err);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Status codes and headers
+// ---------------------------------------------------------------------------
+
+// Static string — do NOT free the result.
+#[export]
+pub fun http_status_text(code: int) <string> {
+    if (code == 200) { return "OK"; }
+    if (code == 201) { return "Created"; }
+    if (code == 204) { return "No Content"; }
+    if (code == 301) { return "Moved Permanently"; }
+    if (code == 302) { return "Found"; }
+    if (code == 304) { return "Not Modified"; }
+    if (code == 400) { return "Bad Request"; }
+    if (code == 401) { return "Unauthorized"; }
+    if (code == 403) { return "Forbidden"; }
+    if (code == 404) { return "Not Found"; }
+    if (code == 405) { return "Method Not Allowed"; }
+    if (code == 409) { return "Conflict"; }
+    if (code == 422) { return "Unprocessable Entity"; }
+    if (code == 500) { return "Internal Server Error"; }
+    if (code == 501) { return "Not Implemented"; }
+    if (code == 503) { return "Service Unavailable"; }
+    return "Unknown";
+}
+
+// Creates an empty header set. Free with http_free_headers.
+#[export]
+pub fun http_new_headers() <&HttpHeaders> {
+    return new HttpHeaders{names: new Collection::<string>{},
+                           values: new Collection::<string>{}};
+}
+
+#[export]
+pub fun http_free_headers(hdrs: &HttpHeaders) <noret> {
+    if (hdrs == null) { return; }
+    let n <int> = hdrs.names.len();
+    for (let i <int> = 0; i < n; i++) {
+        free_str(hdrs.names.get(i));
+        free_str(hdrs.values.get(i));
+    }
+    delete hdrs.names;
+    delete hdrs.values;
+    delete hdrs;
+}
+
+#[export]
+pub fun http_header_has(hdrs: &HttpHeaders, name: string) <bool> {
+    let n <int> = hdrs.names.len();
+    for (let i <int> = 0; i < n; i++) {
+        if (z_name_eq(hdrs.names.get(i), name)) { return true; }
+    }
+    return false;
+}
+
+// Returns the header value, or "" when absent (use http_header_has to tell
+// the two apart — finc 0.4.0 does not allow a Fin function to return null
+// as a string). Borrowed — do not free.
+#[export]
+pub fun http_header_get(hdrs: &HttpHeaders, name: string) <string> {
+    let n <int> = hdrs.names.len();
+    for (let i <int> = 0; i < n; i++) {
+        if (z_name_eq(hdrs.names.get(i), name)) { return hdrs.values.get(i); }
+    }
+    return "";
+}
+
+// Sets a header, replacing any existing one (case-insensitive). Copies both.
+#[export]
+pub fun http_header_set(hdrs: &HttpHeaders, name: string, value: string) <noret> {
+    let n <int> = hdrs.names.len();
+    for (let i <int> = 0; i < n; i++) {
+        if (z_name_eq(hdrs.names.get(i), name)) {
+            free_str(hdrs.values.get(i));
+            hdrs.values.set(i, clone(value));
+            return;
+        }
+    }
+    hdrs.names.push(clone(name));
+    hdrs.values.push(clone(value));
+}
+
+// Number of headers in the set.
+#[export]
+pub fun http_header_count(hdrs: &HttpHeaders) <int> {
+    return hdrs.names.len();
+}
+
+// Name/value of the i-th header. Borrowed — do not free.
+#[export]
+pub fun http_header_name(hdrs: &HttpHeaders, i: int) <string> {
+    return hdrs.names.get(i);
+}
+
+#[export]
+pub fun http_header_value(hdrs: &HttpHeaders, i: int) <string> {
+    return hdrs.values.get(i);
+}
+
+// ---------------------------------------------------------------------------
+// Request / response construction and memory
+// ---------------------------------------------------------------------------
+
+#[export]
+pub fun http_response(status: int, body: string) <&HttpResponse> {
+    let r <&HttpResponse> = new HttpResponse{status: status,
+        headers: http_new_headers(), body: clone(body)};
+    http_header_set(r.headers, "Content-Type", "text/plain; charset=utf-8");
+    let lens <string> = z_itoa(len(body));
+    http_header_set(r.headers, "Content-Length", lens);
+    free_str(lens);
+    return r;
+}
+
+#[export]
+pub fun http_response_with_type(status: int, content_type: string, body: string) <&HttpResponse> {
+    let r <&HttpResponse> = http_response(status, body);
+    http_header_set(r.headers, "Content-Type", content_type);
+    return r;
+}
+
+#[export]
+pub fun http_free_response(r: &HttpResponse) <noret> {
+    if (r == null) { return; }
+    http_free_headers(r.headers);
+    free_str(r.body);
+    delete r;
+}
+
+#[export]
+pub fun http_free_request(q: &HttpRequest) <noret> {
+    if (q == null) { return; }
+    free_str(q.method);
+    free_str(q.target);
+    free_str(q.version);
+    http_free_headers(q.headers);
+    free_str(q.body);
+    delete q;
+}
+
+#[export]
+pub fun http_free_read_result(rr: &HttpReadResult) <noret> {
+    if (rr.ok) {
+        http_free_request(rr.req);
+    } else {
+        free_str(rr.err);
+    }
+}
+
+#[export]
+pub fun http_free_result(r: &HttpResult) <noret> {
+    if (r.headers != null) { http_free_headers(r.headers); }
+    if (r.ok) {
+        free_str(r.body);
+    } else {
+        free_str(r.err);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal: TCP plumbing
+// ---------------------------------------------------------------------------
+
+fun z_sockaddr(host: string, port: int) <[int]> {
+    let a <int> = z_inet_addr(host);
+    blame a != -1, "cannot parse the address as a dotted quad";
+    let addr <[int]> = new [int, 4]{};
+    addr[0] = cast<int>(2 + cast<long>(port / 256) * 65536 +
+                        cast<long>(port % 256) * 16777216);
+    addr[1] = a;
+    return addr;
+}
+
+// Returns a connected fd, or -1 on any failure (never blames).
+fun z_dial(host: string, port: int) <int> {
+    if (port <= 0 || port > 65535) { return -1; }
+    let a <int> = z_inet_addr(host);
+    if (a == -1) { return -1; }
+    let addr <[int]> = z_sockaddr(host, port);
+    let fd <int> = z_socket(2, 1, 0);
+    if (fd < 0) { delete addr; return -1; }
+    let err <int> = z_connect(fd, &addr[0], 16);
+    delete addr;
+    if (err != 0) { z_close(fd); return -1; }
+    return fd;
+}
+
+fun z_send_all(fd: int, bytes: [char], n: int) <bool> {
+    let sent <int> = 0;
+    while (sent < n) {
+        let got <int> = z_send(fd, &bytes[sent], n - sent, 0);
+        if (got <= 0) { return false; }
+        sent = sent + got;
+    }
+    return true;
+}
+
+fun z_send_str(fd: int, s: string) <bool> {
+    let bytes <[char]> = to_chars(s);
+    let ok <bool> = z_send_all(fd, bytes, len(s));
+    delete bytes;
+    return ok;
+}
+
+// Reads until EOF or error. Returns null on read error.
+fun z_read_all(fd: int) <&ZBuf> {
+    let b <&ZBuf> = z_buf_new();
+    while (true) {
+        let chunk <[char]> = new [char, 8193]{};
+        let got <int> = z_recv(fd, &chunk[0], 8192, 0);
+        if (got < 0) {
+            delete chunk;
+            z_buf_free(b);
+            return null;
+        }
+        if (got == 0) {
+            delete chunk;
+            break;
+        }
+        z_buf_append(b, chunk, got);
+        delete chunk;
+    }
+    return b;
+}
+
+// Reads until "\r\n\r\n" is seen, EOF, or error. Returns null on error, or
+// when headers exceed 64 KiB. Any bytes already read past the header end stay
+// in the buffer for the caller.
+fun z_read_headers(fd: int) <&ZBuf> {
+    let b <&ZBuf> = z_buf_new();
+    while (true) {
+        if (z_find_headers_end(b) >= 0) { break; }
+        if (b.len > 65536) {
+            z_buf_free(b);
+            return null;
+        }
+        let chunk <[char]> = new [char, 4097]{};
+        let got <int> = z_recv(fd, &chunk[0], 4096, 0);
+        if (got <= 0) {
+            delete chunk;
+            z_buf_free(b);
+            return null;
+        }
+        z_buf_append(b, chunk, got);
+        delete chunk;
+    }
+    return b;
+}
+
+// Reads exactly `want` more bytes into b. False on EOF/error.
+fun z_read_exact(fd: int, b: &ZBuf, want: int) <bool> {
+    let need <int> = want;
+    while (need > 0) {
+        let cap <int> = 8192;
+        if (need < cap) { cap = need; }
+        let chunk <[char]> = new [char, cap + 1]{};
+        let got <int> = z_recv(fd, &chunk[0], cap, 0);
+        if (got <= 0) {
+            delete chunk;
+            return false;
+        }
+        z_buf_append(b, chunk, got);
+        delete chunk;
+        need = need - got;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Internal: message parsing
+// ---------------------------------------------------------------------------
+
+fun z_read_err(msg: string) <HttpReadResult> {
+    return HttpReadResult{ok: false, req: null, err: clone(msg)};
+}
+
+// Parses one "Name: value" line; returns false when the line is malformed.
+fun z_parse_header_line(line: string, hdrs: &HttpHeaders) <bool> {
+    let colon <int> = find(line, ":");
+    if (colon < 0) { return false; }
+    let name <string> = trim(substr(line, 0, colon));
+    let value <string> = trim(substr(line, colon + 1, len(line) - colon - 1));
+    if (len(name) == 0) {
+        free_str(name);
+        free_str(value);
+        return false;
+    }
+    http_header_set(hdrs, name, value);
+    free_str(name);
+    free_str(value);
+    return true;
+}
+
+// Parses header block text (lines separated by \r\n) into hdrs.
+fun z_parse_header_block(text: string, hdrs: &HttpHeaders) <noret> {
+    let pos <int> = 0;
+    let total <int> = len(text);
+    while (pos < total) {
+        let eol <int> = find(substr(text, pos, total - pos), "\r\n");
+        let line <string> = null;
+        if (eol < 0) {
+            line = substr(text, pos, total - pos);
+            pos = total;
+        } else {
+            line = substr(text, pos, eol);
+            pos = pos + eol + 2;
+        }
+        if (len(line) > 0) {
+            z_parse_header_line(line, hdrs);
+        }
+        free_str(line);
+    }
+}
+
+// De-chunks a body starting at body_start in b. Returns a fresh buffer with
+// the decoded body, or null on malformed chunks.
+fun z_dechunk(b: &ZBuf, body_start: int) <&ZBuf> {
+    let out <&ZBuf> = z_buf_new();
+    let pos <int> = body_start;
+    while (true) {
+        // chunk-size line
+        let eol <int> = pos;
+        while (eol + 1 < b.len) {
+            if (b.data[eol] == '\r' && b.data[eol + 1] == '\n') { break; }
+            eol = eol + 1;
+        }
+        if (eol + 1 >= b.len) {
+            z_buf_free(out);
+            return null;
+        }
+        // strip chunk extensions after ';'
+        let semi <int> = pos;
+        while (semi < eol && b.data[semi] != ';') { semi = semi + 1; }
+        let sizetext <string> = from_chars(b.data, pos, semi - pos);
+        let size <int> = z_parse_hex(trim(sizetext));
+        free_str(sizetext);
+        if (size < 0) {
+            z_buf_free(out);
+            return null;
+        }
+        pos = eol + 2;
+        if (size == 0) {
+            break;
+        }
+        if (pos + size + 2 > b.len) {
+            z_buf_free(out);
+            return null;
+        }
+        z_buf_reserve(out, size);
+        for (let i <int> = 0; i < size; i++) {
+            out.data[out.len + i] = b.data[pos + i];
+        }
+        out.len = out.len + size;
+        pos = pos + size + 2; // skip trailing CRLF
+    }
+    return out;
+}
+
+fun z_http_err(msg: string) <HttpResult> {
+    return HttpResult{ok: false, status: 0, headers: null, body: "", err: clone(msg)};
+}
+
+// Parses a full response buffer into an HttpResult. `raw` is consumed.
+fun z_parse_response(raw: &ZBuf) <HttpResult> {
+    let hend <int> = z_find_headers_end(raw);
+    if (hend < 0) {
+        z_buf_free(raw);
+        return z_http_err("malformed response: no header terminator");
+    }
+    let head <string> = from_chars(raw.data, 0, hend);
+    let eol <int> = find(head, "\r\n");
+    if (eol < 0) {
+        free_str(head);
+        z_buf_free(raw);
+        return z_http_err("malformed response: no status line");
+    }
+    let status_line <string> = substr(head, 0, eol);
+    let rest <string> = substr(head, eol + 2, len(head) - eol - 2);
+    free_str(head);
+    // status line: HTTP/1.1 200 OK
+    let sp1 <int> = find(status_line, " ");
+    if (sp1 < 0) {
+        free_str(status_line);
+        free_str(rest);
+        z_buf_free(raw);
+        return z_http_err("malformed status line");
+    }
+    let after <string> = substr(status_line, sp1 + 1, len(status_line) - sp1 - 1);
+    free_str(status_line);
+    let sp2 <int> = find(after, " ");
+    let codetext <string> = null;
+    if (sp2 < 0) {
+        codetext = clone(after);
+    } else {
+        codetext = substr(after, 0, sp2);
+    }
+    free_str(after);
+    let status <int> = z_parse_uint(trim(codetext));
+    free_str(codetext);
+    if (status <= 0) {
+        free_str(rest);
+        z_buf_free(raw);
+        return z_http_err("malformed status code");
+    }
+    let hdrs <&HttpHeaders> = http_new_headers();
+    z_parse_header_block(rest, hdrs);
+    free_str(rest);
+    let body_start <int> = hend + 4;
+    let body <string> = "";
+    let has_te <bool> = http_header_has(hdrs, "Transfer-Encoding");
+    let has_cl <bool> = http_header_has(hdrs, "Content-Length");
+    if (has_te && z_name_eq(http_header_get(hdrs, "Transfer-Encoding"), "chunked")) {
+        let decoded <&ZBuf> = z_dechunk(raw, body_start);
+        z_buf_free(raw);
+        if (decoded == null) {
+            http_free_headers(hdrs);
+            return z_http_err("malformed chunked body");
+        }
+        body = z_buf_to_string(decoded);
+        z_buf_free(decoded);
+    } else if (has_cl) {
+        let want <int> = z_parse_uint(trim(http_header_get(hdrs, "Content-Length")));
+        if (want < 0 || body_start + want > raw.len) {
+            z_buf_free(raw);
+            http_free_headers(hdrs);
+            return z_http_err("body shorter than Content-Length");
+        }
+        body = from_chars(raw.data, body_start, want);
+        z_buf_free(raw);
+    } else {
+        body = from_chars(raw.data, body_start, raw.len - body_start);
+        z_buf_free(raw);
+    }
+    return HttpResult{ok: true, status: status, headers: hdrs, body: body, err: ""};
+}
+
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
+
+fun z_http_do(method: string, url: string, content_type: string, body: string, has_body: bool) <HttpResult> {
+    let parsed <HttpUrlResult> = http_parse_url(url);
+    if (!parsed.ok) {
+        let r <HttpResult> = z_http_err(parsed.err);
+        free_str(parsed.err);
+        return r;
+    }
+    let fd <int> = z_dial(parsed.url.host, parsed.url.port);
+    if (fd < 0) {
+        let msg <string> = z_calloc(cast<ulong>(128), cast<ulong>(1));
+        z_snprintf(msg, cast<ulong>(128), "cannot connect to %s:%d", parsed.url.host, parsed.url.port);
+        let r2 <HttpResult> = z_http_err(msg);
+        z_cfree(msg);
+        http_free_url_result(&parsed);
+        return r2;
+    }
+    let req <&ZBuf> = z_buf_new();
+    z_buf_append_str(req, method);
+    z_buf_push(req, ' ');
+    z_buf_append_str(req, parsed.url.path);
+    if (len(parsed.url.query) > 0) {
+        z_buf_push(req, '?');
+        z_buf_append_str(req, parsed.url.query);
+    }
+    z_buf_append_str(req, " HTTP/1.1\r\nHost: ");
+    z_buf_append_str(req, parsed.url.host);
+    if (parsed.url.port != 80) {
+        z_buf_push(req, ':');
+        let ports <string> = z_itoa(parsed.url.port);
+        z_buf_append_str(req, ports);
+        free_str(ports);
+    }
+    z_buf_append_str(req, "\r\nUser-Agent: zhttp/0.1.0\r\nConnection: close\r\n");
+    if (has_body) {
+        z_buf_append_str(req, "Content-Type: ");
+        z_buf_append_str(req, content_type);
+        z_buf_append_str(req, "\r\nContent-Length: ");
+        let lens <string> = z_itoa(len(body));
+        z_buf_append_str(req, lens);
+        free_str(lens);
+        z_buf_append_str(req, "\r\n");
+    }
+    z_buf_append_str(req, "\r\n");
+    if (has_body) {
+        z_buf_append_str(req, body);
+    }
+    http_free_url_result(&parsed);
+    if (!z_send_all(fd, req.data, req.len)) {
+        z_buf_free(req);
+        z_close(fd);
+        return z_http_err("send failed");
+    }
+    z_buf_free(req);
+    let raw <&ZBuf> = z_read_all(fd);
+    z_close(fd);
+    if (raw == null) {
+        return z_http_err("read failed");
+    }
+    return z_parse_response(raw);
+}
+
+#[export]
+pub fun http_get(url: string) <HttpResult> {
+    return z_http_do("GET", url, "", "", false);
+}
+
+#[export]
+pub fun http_post(url: string, content_type: string, body: string) <HttpResult> {
+    return z_http_do("POST", url, content_type, body, true);
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+#[export]
+pub fun http_listen(port: int) <&HttpServer> {
+    blame port >= 0, "http_listen: port cannot be negative";
+    blame port <= 65535, "http_listen: port out of range";
+    let addr <[int]> = z_sockaddr("0.0.0.0", port);
+    let fd <int> = z_socket(2, 1, 0);
+    blame fd >= 0, "http_listen: cannot open socket";
+    let bound <int> = z_bind(fd, &addr[0], 16);
+    if (bound != 0) {
+        z_close(fd);
+        delete addr;
+        blame bound == 0, "http_listen: cannot bind (port in use?)";
+    }
+    let err <int> = z_listen(fd, 16);
+    if (err != 0) {
+        z_close(fd);
+        delete addr;
+        blame err == 0, "http_listen: cannot listen";
+    }
+    delete addr;
+    return new HttpServer{fd: fd};
+}
+
+// The port the server is bound to (useful with http_listen(0)).
+#[export]
+pub fun http_server_port(srv: &HttpServer) <int> {
+    let got <[int]> = new [int, 4]{};
+    let glen <int> = 16;
+    let r <int> = z_getsockname(srv.fd, &got[0], &glen);
+    blame r == 0, "http_server_port: cannot read local address";
+    let u <uint> = cast<uint>(got[0]);
+    let hi <uint> = (u / cast<uint>(65536)) % cast<uint>(256);
+    let lo <uint> = (u / cast<uint>(16777216)) % cast<uint>(256);
+    delete got;
+    return cast<int>(hi * cast<uint>(256) + lo);
+}
+
+#[export]
+pub fun http_accept(srv: &HttpServer) <&HttpConn> {
+    let peer <[int]> = new [int, 4]{};
+    let peerlen <int> = 16;
+    let fd <int> = z_accept(srv.fd, &peer[0], &peerlen);
+    blame fd >= 0, "http_accept: cannot accept connection";
+    delete peer;
+    return new HttpConn{fd: fd};
+}
+
+#[export]
+pub fun http_read_request(conn: &HttpConn) <HttpReadResult> {
+    let raw <&ZBuf> = z_read_headers(conn.fd);
+    if (raw == null) {
+        return z_read_err("cannot read request headers (EOF, error, or headers > 64KiB)");
+    }
+    let hend <int> = z_find_headers_end(raw);
+    let head <string> = from_chars(raw.data, 0, hend);
+    let eol <int> = find(head, "\r\n");
+    if (eol < 0) {
+        free_str(head);
+        z_buf_free(raw);
+        return z_read_err("malformed request: no request line");
+    }
+    let request_line <string> = substr(head, 0, eol);
+    let rest <string> = substr(head, eol + 2, len(head) - eol - 2);
+    free_str(head);
+    let sp1 <int> = find(request_line, " ");
+    if (sp1 < 0) {
+        free_str(request_line);
+        free_str(rest);
+        z_buf_free(raw);
+        return z_read_err("malformed request line");
+    }
+    let method <string> = substr(request_line, 0, sp1);
+    let after <string> = substr(request_line, sp1 + 1, len(request_line) - sp1 - 1);
+    free_str(request_line);
+    let sp2 <int> = find(after, " ");
+    if (sp2 < 0) {
+        free_str(method);
+        free_str(after);
+        free_str(rest);
+        z_buf_free(raw);
+        return z_read_err("malformed request line");
+    }
+    let target <string> = substr(after, 0, sp2);
+    let version <string> = trim(substr(after, sp2 + 1, len(after) - sp2 - 1));
+    free_str(after);
+    let hdrs <&HttpHeaders> = http_new_headers();
+    z_parse_header_block(rest, hdrs);
+    free_str(rest);
+    // body (always malloc'd so ownership is uniform: free unconditionally)
+    let body <string> = clone("");
+    if (http_header_has(hdrs, "Content-Length")) {
+        let want <int> = z_parse_uint(trim(http_header_get(hdrs, "Content-Length")));
+        if (want < 0) {
+            z_buf_free(raw);
+            http_free_headers(hdrs);
+            free_str(method);
+            free_str(target);
+            free_str(version);
+            return z_read_err("invalid Content-Length");
+        }
+        if (want > 16777216) {
+            z_buf_free(raw);
+            http_free_headers(hdrs);
+            free_str(method);
+            free_str(target);
+            free_str(version);
+            return z_read_err("request body too large (> 16MiB)");
+        }
+        let have <int> = raw.len - (hend + 4);
+        if (have < want) {
+            if (!z_read_exact(conn.fd, raw, want - have)) {
+                z_buf_free(raw);
+                http_free_headers(hdrs);
+                free_str(method);
+                free_str(target);
+                free_str(version);
+                return z_read_err("body shorter than Content-Length");
+            }
+        }
+        body = from_chars(raw.data, hend + 4, want);
+    }
+    z_buf_free(raw);
+    let req <&HttpRequest> = new HttpRequest{method: method, target: target, version: version,
+                                            headers: hdrs, body: body};
+    return HttpReadResult{ok: true, req: req, err: ""};
+}
+
+#[export]
+pub fun http_write_response(conn: &HttpConn, resp: &HttpResponse) <bool> {
+    let out <&ZBuf> = z_buf_new();
+    z_buf_append_str(out, "HTTP/1.1 ");
+    let codes <string> = z_itoa(resp.status);
+    z_buf_append_str(out, codes);
+    free_str(codes);
+    z_buf_push(out, ' ');
+    z_buf_append_str(out, http_status_text(resp.status));
+    z_buf_append_str(out, "\r\n");
+    let n <int> = http_header_count(resp.headers);
+    let has_length <bool> = false;
+    for (let i <int> = 0; i < n; i++) {
+        let hname <string> = http_header_name(resp.headers, i);
+        z_buf_append_str(out, hname);
+        z_buf_append_str(out, ": ");
+        z_buf_append_str(out, http_header_value(resp.headers, i));
+        z_buf_append_str(out, "\r\n");
+        if (z_name_eq(hname, "Content-Length")) { has_length = true; }
+    }
+    if (!has_length) {
+        z_buf_append_str(out, "Content-Length: ");
+        let lens <string> = z_itoa(len(resp.body));
+        z_buf_append_str(out, lens);
+        free_str(lens);
+        z_buf_append_str(out, "\r\n");
+    }
+    z_buf_append_str(out, "Connection: close\r\n\r\n");
+    if (resp.body != null) {
+        z_buf_append_str(out, resp.body);
+    }
+    let ok <bool> = z_send_all(conn.fd, out.data, out.len);
+    z_buf_free(out);
+    return ok;
+}
+
+// Writes raw bytes on the connection (e.g. for protocol upgrades such as
+// WebSocket handshakes, or responses with unusual framing). False on failure.
+#[export]
+pub fun http_write_raw(conn: &HttpConn, text: string) <bool> {
+    return z_send_str(conn.fd, text);
+}
+
+#[export]
+pub fun http_close(conn: &HttpConn) <noret> {    if (conn == null) { return; }
+    z_close(conn.fd);
+    delete conn;
+}
+
+#[export]
+pub fun http_server_close(srv: &HttpServer) <noret> {
+    if (srv == null) { return; }
+    z_close(srv.fd);
+    delete srv;
+}
+
+}

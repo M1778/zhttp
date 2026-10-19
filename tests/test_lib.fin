@@ -1,0 +1,250 @@
+// Tests for zhttp. Run: finc -I ../src tests/test_lib.fin -o test_zhttp && ./test_zhttp
+import {
+    HttpHeaders, HttpRequest, HttpResponse, HttpUrl, HttpUrlResult,
+    HttpResult, HttpReadResult, HttpServer, HttpConn,
+    http_parse_url, http_free_url_result,
+    http_status_text, http_new_headers, http_free_headers,
+    http_header_has, http_header_get, http_header_set,
+    http_header_count, http_header_name, http_header_value,
+    http_response, http_response_with_type, http_free_response, http_free_request,
+    http_free_read_result, http_free_result, http_get, http_post,
+    http_listen, http_server_port, http_accept, http_read_request,
+    http_write_response, http_write_raw, http_close, http_server_close
+} from zhttp::fin;
+import { assert_true, assert_eq_int, assert_eq_string } from testing::std;
+import { free_str, equals } from strings::std;
+
+#[llvm_name="snprintf"]
+@define t_snprintf(buf: string, size: ulong, fmt: string, ...) <int>;
+
+#[llvm_name="calloc"]
+@define t_calloc(count: ulong, size: ulong) <string>;
+
+#[llvm_name="free"]
+@define t_cfree(p: string) <noret>;
+
+#[llvm_name="fork"]
+@define t_fork() <int>;
+
+#[llvm_name="usleep"]
+@define t_usleep(usec: int) <int>;
+
+#[llvm_name="_exit"]
+@define t_exit(code: int) <noret>;
+
+#[llvm_name="waitpid"]
+@define t_waitpid(pid: int, status: &int, opts: int) <int>;
+
+fun test_url_parsing() <noret> {
+    let r <HttpUrlResult> = http_parse_url("http://127.0.0.1:8080/path?q=1");
+    assert_true(r.ok, "url: ok");
+    assert_eq_string(r.url.scheme, "http", "url: scheme");
+    assert_eq_string(r.url.host, "127.0.0.1", "url: host");
+    assert_eq_int(r.url.port, 8080, "url: port");
+    assert_eq_string(r.url.path, "/path", "url: path");
+    assert_eq_string(r.url.query, "q=1", "url: query");
+    http_free_url_result(&r);
+
+    r = http_parse_url("http://example.com");
+    assert_true(r.ok, "url: bare host ok");
+    assert_eq_int(r.url.port, 80, "url: default port 80");
+    assert_eq_string(r.url.path, "/", "url: default path /");
+    assert_eq_string(r.url.query, "", "url: empty query");
+    http_free_url_result(&r);
+
+    r = http_parse_url("HTTP://127.0.0.1/");
+    assert_true(r.ok, "url: uppercase scheme ok");
+    http_free_url_result(&r);
+
+    r = http_parse_url("https://127.0.0.1/");
+    assert_true(!r.ok, "url: https rejected");
+    http_free_url_result(&r);
+
+    r = http_parse_url("127.0.0.1:8080/path");
+    assert_true(!r.ok, "url: missing scheme rejected");
+    http_free_url_result(&r);
+
+    r = http_parse_url("http://127.0.0.1:abc/");
+    assert_true(!r.ok, "url: bad port rejected");
+    http_free_url_result(&r);
+
+    r = http_parse_url("http://127.0.0.1:99999/");
+    assert_true(!r.ok, "url: port out of range rejected");
+    http_free_url_result(&r);
+
+    r = http_parse_url("http:///path");
+    assert_true(!r.ok, "url: missing host rejected");
+    http_free_url_result(&r);
+
+    r = http_parse_url("http://10.0.0.5:1/a/b?x=1&y=2");
+    assert_true(r.ok, "url: complex ok");
+    assert_eq_string(r.url.path, "/a/b", "url: multi-segment path");
+    assert_eq_string(r.url.query, "x=1&y=2", "url: multi-param query");
+    http_free_url_result(&r);
+
+    printf("url parsing: ok\n");
+}
+
+fun test_status_and_headers() <noret> {
+    assert_eq_string(http_status_text(200), "OK", "status 200");
+    assert_eq_string(http_status_text(404), "Not Found", "status 404");
+    assert_eq_string(http_status_text(500), "Internal Server Error", "status 500");
+    assert_eq_string(http_status_text(999), "Unknown", "status unknown");
+
+    let hdrs <&HttpHeaders> = http_new_headers();
+    http_header_set(hdrs, "Content-Type", "text/html");
+    assert_true(http_header_has(hdrs, "content-type"), "header has (lower)");
+    assert_true(http_header_has(hdrs, "CONTENT-TYPE"), "header has (upper)");
+    assert_true(!http_header_has(hdrs, "X-Missing"), "header missing -> has false");
+    assert_eq_string(http_header_get(hdrs, "content-type"), "text/html", "header case-insensitive get");
+    assert_eq_string(http_header_get(hdrs, "CONTENT-TYPE"), "text/html", "header upper get");
+    assert_eq_string(http_header_get(hdrs, "X-Missing"), "", "header missing -> empty");
+    // replace keeps a single entry
+    http_header_set(hdrs, "content-type", "application/json");
+    assert_eq_int(http_header_count(hdrs), 1, "header replace keeps count 1");
+    assert_eq_string(http_header_get(hdrs, "Content-Type"), "application/json", "header replaced value");
+    assert_eq_string(http_header_name(hdrs, 0), "Content-Type", "header name accessor");
+    assert_eq_string(http_header_value(hdrs, 0), "application/json", "header value accessor");
+    http_free_headers(hdrs);
+
+    let resp <&HttpResponse> = http_response(201, "created!");
+    assert_eq_int(resp.status, 201, "response status");
+    assert_eq_string(http_header_get(resp.headers, "Content-Length"), "8", "response content-length");
+    assert_eq_string(http_header_get(resp.headers, "Content-Type"), "text/plain; charset=utf-8", "response content-type");
+    http_free_response(resp);
+
+    let resp2 <&HttpResponse> = http_response_with_type(200, "application/json", "{}");
+    assert_eq_string(http_header_get(resp2.headers, "Content-Type"), "application/json", "response custom type");
+    http_free_response(resp2);
+
+    printf("status and headers: ok\n");
+}
+
+fun test_loopback_get() <noret> {
+    let srv <&HttpServer> = http_listen(0);
+    let port <int> = http_server_port(srv);
+    assert_true(port > 0, "loopback: ephemeral port assigned");
+
+    let pid <int> = t_fork();
+    blame pid >= 0, "loopback: fork failed";
+    if (pid == 0) {
+        let conn <&HttpConn> = http_accept(srv);
+        let rr <HttpReadResult> = http_read_request(conn);
+        if (rr.ok) {
+            let ok_method <bool> = equals(rr.req.method, "GET");
+            let ok_target <bool> = equals(rr.req.target, "/hello?name=fin");
+            let resp <&HttpResponse> = null;
+            if (ok_method && ok_target) {
+                resp = http_response(200, "hello, fin!");
+            } else {
+                resp = http_response(400, "bad request");
+            }
+            http_write_response(conn, resp);
+            http_free_response(resp);
+            http_free_read_result(&rr);
+        } else {
+            http_free_read_result(&rr);
+        }
+        http_close(conn);
+        http_server_close(srv);
+        t_exit(0);
+    }
+    t_usleep(400000);
+    let url <string> = t_calloc(cast<ulong>(256), cast<ulong>(1));
+    t_snprintf(url, cast<ulong>(256), "http://127.0.0.1:%d/hello?name=fin", port);
+    let r <HttpResult> = http_get(url);
+    t_cfree(url);
+    assert_true(r.ok, "loopback GET: ok");
+    assert_eq_int(r.status, 200, "loopback GET: status 200");
+    assert_eq_string(r.body, "hello, fin!", "loopback GET: body");
+    assert_true(http_header_count(r.headers) > 0, "loopback GET: headers present");
+    http_free_result(&r);
+    let status <int> = 0;
+    t_waitpid(pid, &status, 0);
+    http_server_close(srv);
+    printf("loopback GET: ok\n");
+}
+
+fun test_loopback_post_and_chunked() <noret> {
+    let srv <&HttpServer> = http_listen(0);
+    let port <int> = http_server_port(srv);
+
+    let pid <int> = t_fork();
+    blame pid >= 0, "loopback: fork failed";
+    if (pid == 0) {
+        // serve two connections: one POST echo, one chunked GET
+        for (let c <int> = 0; c < 2; c++) {
+            let conn <&HttpConn> = http_accept(srv);
+            let rr <HttpReadResult> = http_read_request(conn);
+            if (rr.ok) {
+                if (equals(rr.req.target, "/echo")) {
+                    let resp <&HttpResponse> = http_response_with_type(200, "application/json", rr.req.body);
+                    http_write_response(conn, resp);
+                    http_free_response(resp);
+                } else {
+                    // raw chunked response: "Hello, " + "chunked!"
+                    http_write_raw(conn, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n7\r\nHello, \r\n8\r\nchunked!\r\n0\r\n\r\n");
+                }
+                http_free_read_result(&rr);
+            } else {
+                http_free_read_result(&rr);
+            }
+            http_close(conn);
+        }
+        http_server_close(srv);
+        t_exit(0);
+    }
+    t_usleep(400000);
+
+    // POST with JSON body
+    let url <string> = t_calloc(cast<ulong>(256), cast<ulong>(1));
+    t_snprintf(url, cast<ulong>(256), "http://127.0.0.1:%d/echo", port);
+    let r <HttpResult> = http_post(url, "application/json", "{\"ping\": true}");
+    t_cfree(url);
+    assert_true(r.ok, "loopback POST: ok");
+    assert_eq_int(r.status, 200, "loopback POST: status 200");
+    assert_eq_string(r.body, "{\"ping\": true}", "loopback POST: echo body");
+    http_free_result(&r);
+
+    // GET with chunked response
+    let url2 <string> = t_calloc(cast<ulong>(256), cast<ulong>(1));
+    t_snprintf(url2, cast<ulong>(256), "http://127.0.0.1:%d/chunked", port);
+    let r2 <HttpResult> = http_get(url2);
+    t_cfree(url2);
+    assert_true(r2.ok, "loopback chunked: ok");
+    assert_eq_int(r2.status, 200, "loopback chunked: status 200");
+    assert_eq_string(r2.body, "Hello, chunked!", "loopback chunked: de-chunked body");
+    http_free_result(&r2);
+
+    let status <int> = 0;
+    t_waitpid(pid, &status, 0);
+    http_server_close(srv);
+    printf("loopback POST + chunked: ok\n");
+}
+
+fun test_client_errors() <noret> {
+    // Closed port on loopback: connect must fail cleanly and fast, not abort.
+    let r <HttpResult> = http_get("http://127.0.0.1:1/");
+    assert_true(!r.ok, "client: connect failure is recoverable");
+    assert_true(r.err != null, "client: error message present");
+    http_free_result(&r);
+
+    let r2 <HttpResult> = http_get("https://127.0.0.1/");
+    assert_true(!r2.ok, "client: https rejected");
+    http_free_result(&r2);
+
+    let r3 <HttpResult> = http_get("not a url");
+    assert_true(!r3.ok, "client: malformed url rejected");
+    http_free_result(&r3);
+
+    printf("client errors: ok\n");
+}
+
+fun main() <noret> {
+    test_url_parsing();
+    test_status_and_headers();
+    test_loopback_get();
+    test_loopback_post_and_chunked();
+    test_client_errors();
+    printf("zhttp: all tests passed\n");
+}

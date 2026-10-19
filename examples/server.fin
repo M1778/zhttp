@@ -1,0 +1,42 @@
+// zhttp example: a tiny HTTP server with routing.
+// Serves GET / (hello), GET /json (a JSON payload), and 404 otherwise.
+// Run: ./server_example, then curl http://127.0.0.1:8080/
+import {
+    HttpRequest, HttpResponse, HttpReadResult, HttpServer, HttpConn,
+    http_listen, http_server_port, http_accept, http_read_request,
+    http_write_response, http_response, http_response_with_type,
+    http_free_response, http_free_read_result, http_close, http_server_close
+} from zhttp::fin;
+import { free_str, equals } from strings::std;
+
+fun handle(req: &HttpRequest) <&HttpResponse> {
+    if (equals(req.method, "GET") && equals(req.target, "/")) {
+        return http_response(200, "Hello from zhttp!\n");
+    }
+    if (equals(req.method, "GET") && equals(req.target, "/json")) {
+        return http_response_with_type(200, "application/json", "{\"server\": \"zhttp\", \"ok\": true}");
+    }
+    return http_response(404, "not found\n");
+}
+
+fun main() <noret> {
+    let srv <&HttpServer> = http_listen(8080);
+    printf("zhttp example server on http://127.0.0.1:%d/ (Ctrl-C to stop)\n", http_server_port(srv));
+    while (true) {
+        let conn <&HttpConn> = http_accept(srv);
+        let rr <HttpReadResult> = http_read_request(conn);
+        if (rr.ok) {
+            let resp <&HttpResponse> = handle(rr.req);
+            http_write_response(conn, resp);
+            http_free_response(resp);
+            http_free_read_result(&rr);
+        } else {
+            let resp <&HttpResponse> = http_response(400, "bad request\n");
+            http_write_response(conn, resp);
+            http_free_response(resp);
+            http_free_read_result(&rr);
+        }
+        http_close(conn);
+    }
+    http_server_close(srv);
+}

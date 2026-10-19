@@ -1,0 +1,16 @@
+// zhttp example: simple HTTP client.
+// Usage: ./client_example http://127.0.0.1:8080/
+import { HttpResult, http_get, http_free_result } from zhttp::fin;
+
+fun main() <noret> {
+    // Change this to any http:// URL with a dotted-quad host.
+    let r <HttpResult> = http_get("http://127.0.0.1:8080/");
+    if (!r.ok) {
+        printf("request failed: %s\n", r.err);
+        http_free_result(&r);
+        return;
+    }
+    printf("status: %d\n", r.status);
+    printf("body:\n%s\n", r.body);
+    http_free_result(&r);
+}

@@ -1,0 +1,7 @@
+.finn/
+out/
+*.o
+*.exe
+test_zhttp
+server_example
+client_example

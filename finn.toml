@@ -1,0 +1,10 @@
+[project]
+name = "zhttp"
+version = "0.1.0"
+envpath = ".finn"
+entrypoint = "zhttp.fin"
+
+[packages]
+
+[scripts]
+test = "finc -I src tests/test_lib.fin -o test_zhttp && ./test_zhttp"

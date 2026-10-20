@@ -107,12 +107,25 @@ fun http_free_read_result(rr: &HttpReadResult) <noret>
 fun http_write_response(conn: &HttpConn, resp: &HttpResponse) <bool>
 fun http_write_raw(conn: &HttpConn, text: string) <bool> // raw bytes (e.g. upgrades)
 fun http_close(conn: &HttpConn) <noret>
+fun http_detach(conn: &HttpConn) <int> // frees wrapper, transfers fd ownership
 ```
 
-`http_read_request` never aborts on malformed client input — it returns
-`ok == false` with a message, so a bad client can't crash the server.
-`http_listen`/`http_accept` abort (`blame`) on failure, matching
-`networking::std`'s contract: a server that can't bind or accept can't proceed.
+`http_read_request` rejects malformed input with `ok == false`; close the
+connection after rejection rather than attempting to resynchronize. Duplicate
+Content-Length or Transfer-Encoding fields, duplicate Host/WebSocket handshake
+singletons, TE+CL, malformed field syntax, and all request transfer codings are
+rejected. Chunked **responses** are supported;
+chunked requests are not.
+
+Header reads consume exactly through CRLFCRLF, and length-delimited request
+bodies consume exactly their declared length. Bytes for an upgraded protocol
+remain in the socket. `http_detach` frees the connection wrapper without closing
+the fd; after detaching, do not use the wrapper, and eventually close the returned
+fd yourself. Only one reader may access a connection at a time.
+
+`http_listen`/`http_accept` still abort (`blame`) on permanent failures.
+Interrupted accept/send/recv calls are retried; Linux `MSG_NOSIGNAL` suppresses
+SIGPIPE per send without modifying the application's signal handlers.
 
 ### Responses
 
@@ -124,7 +137,8 @@ fun http_free_request(q: &HttpRequest) <noret>
 ```
 
 `http_response` sets `Content-Type: text/plain; charset=utf-8` and a correct
-`Content-Length` automatically.
+`Content-Length` automatically, except for 1xx/204 where length is forbidden.
+The writer omits bodies for 1xx, 204, and 304 responses.
 
 ### Headers and status codes
 
@@ -149,24 +163,45 @@ use `http_header_has` to distinguish missing from empty.
 - **IPv4 dotted-quad hosts only** — no DNS resolution (`http://127.0.0.1:8080/`
   works; `http://localhost/` does not). Same limitation as `networking::std`.
 - **No TLS** — `https://` URLs are rejected with an explicit error.
-- **Blocking I/O** — one connection at a time per thread; use one process per
-  connection (fork) or add threads for concurrency.
-- Request bodies are capped at 16 MiB; request headers at 64 KiB.
+- **Linux/POSIX transport** — socket ABI, `MSG_PEEK`, `MSG_NOSIGNAL`, and
+  `__errno_location` currently target 64-bit Linux. Other platforms need bindings.
+  `send`/`recv` use `ulong` lengths and `long` results; do not mix these with
+  legacy `networking::std` int-sized declarations of the same linker symbols.
+  Consumers such as fin-websocket need the coordinated updated bindings.
+- **Blocking I/O without deadlines** — framed responses return at message
+  completion, not EOF, but incomplete messages and close-delimited responses can
+  still wait indefinitely. Applications must provide deadlines/concurrency.
+- Request and response bodies are capped at **16 MiB**, including aggregate
+  decoded chunk data. Port parsing remains independently bounded to 1–65535.
+- Request and response header blocks are capped at **64 KiB**, including the
+  start line and final CRLFCRLF, with at most **256 fields**.
+- Chunk-size/extension and trailer lines are capped at **8 KiB** each; aggregate
+  chunk metadata (size lines, data delimiters, and trailers) is capped at **64 KiB**,
+  with at most **256 trailer fields**. Trailers are validated then discarded;
+  framing/routing fields are forbidden in trailers. At most 16 informational
+  responses are skipped before a final response.
 - Bodies are byte strings; embedded NUL bytes truncate (Fin strings are
-  NUL-terminated).
+  NUL-terminated). Header NUL bytes are rejected.
 
 ## Dependencies
 
 - Fin standard library only (`collection::std`, `strings::std`, `testing::std`
-  for tests). The socket layer re-declares libc's socket calls with the same
-  ABI as `networking::std` (vendored because only `#[global]` externs lower
-  through a module import — see `docs/guide/10-modules-and-imports.md`).
+  for tests). Local libc socket bindings are vendored because only `#[global]`
+  externs lower through module imports. Unlike legacy `networking::std`, the
+  send/recv declarations here use the correct 64-bit Linux ABI.
 
 ## Development
 
 ```sh
 finc -I src tests/test_lib.fin -o test_zhttp && ./test_zhttp
+python3 -I tests/test_protocol.py ./test_zhttp
 ```
+
+Repeat with `-O2` as well as the default `-O0`. The Python peer suite uses
+loopback ephemeral ports/socketpairs to exercise malformed framing, exact
+limits, truncation, keep-open responses, upgrade handoff, and peer-close writes.
+It also uses `cc` to build a temporary fault-injection shim for EINTR and partial
+send/recv coverage. No external service is required.
 
 ## Changelog
 

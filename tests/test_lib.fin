@@ -9,10 +9,60 @@ import {
     http_response, http_response_with_type, http_free_response, http_free_request,
     http_free_read_result, http_free_result, http_get, http_post,
     http_listen, http_server_port, http_accept, http_read_request,
-    http_write_response, http_write_raw, http_close, http_server_close
+    http_write_response, http_write_raw, http_close, http_detach, http_server_close
 } from zhttp::fin;
 import { assert_true, assert_eq_int, assert_eq_string } from testing::std;
-import { free_str, equals } from strings::std;
+import { free_str, equals, len } from strings::std;
+
+#[llvm_name="getenv"]
+@define t_getenv(name: string) <string>;
+#[llvm_name="atoi"]
+@define t_atoi(text: string) <int>;
+#[llvm_name="recv"]
+@define t_recv(fd: int, bytes: &char, size: ulong, flags: int) <long>;
+#[llvm_name="close"]
+@define t_close(fd: int) <int>;
+
+// Public-API driver for test_protocol.py's adversarial TCP/socketpair peers.
+// The ordinary test entry point remains unchanged when ZHTTP_TEST_MODE is absent.
+fun protocol_driver(mode: string) <noret> {
+    if (equals(mode, "client")) {
+        let r <HttpResult> = http_get(t_getenv("ZHTTP_TEST_URL"));
+        if (r.ok) { printf("ACCEPT %d %d\n", r.status, len(r.body)); }
+        else { printf("REJECT\n"); }
+        http_free_result(&r);
+        return;
+    }
+    let conn <&HttpConn> = new HttpConn{fd: t_atoi(t_getenv("ZHTTP_TEST_FD"))};
+    if (equals(mode, "response")) {
+        let resp <&HttpResponse> = http_response(204, "must not be sent");
+        let ok <bool> = http_write_response(conn, resp);
+        http_free_response(resp);
+        http_close(conn);
+        assert_true(ok, "204 response writes");
+        printf("SENT\n");
+        return;
+    }
+    if (equals(mode, "write")) {
+        let ok <bool> = http_write_raw(conn, "probe");
+        if (ok) { printf("SENT\n"); } else { printf("SEND_FAILED\n"); }
+        http_close(conn);
+        return;
+    }
+    let rr <HttpReadResult> = http_read_request(conn);
+    if (rr.ok) { printf("ACCEPT %d\n", len(rr.req.body)); }
+    else { printf("REJECT\n"); }
+    http_free_read_result(&rr);
+    if (equals(mode, "upgrade")) {
+        let fd <int> = http_detach(conn);
+        let bytes <[char]> = new [char, 4]{};
+        let got <long> = t_recv(fd, &bytes[0], cast<ulong>(4), 0);
+        assert_true(got == 4 && bytes[0] == 'T' && bytes[1] == 'A' && bytes[2] == 'I' && bytes[3] == 'L', "upgrade tail preserved");
+        delete bytes;
+        t_close(fd);
+        printf("TAIL_OK\n");
+    } else { http_close(conn); }
+}
 
 #[llvm_name="snprintf"]
 @define t_snprintf(buf: string, size: ulong, fmt: string, ...) <int>;
@@ -241,6 +291,8 @@ fun test_client_errors() <noret> {
 }
 
 fun main() <noret> {
+    let mode <string> = t_getenv("ZHTTP_TEST_MODE");
+    if (mode != null) { protocol_driver(mode); return; }
     test_url_parsing();
     test_status_and_headers();
     test_loopback_get();

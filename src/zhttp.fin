@@ -10,15 +10,16 @@
 // networking::std: only `#[global]` externs lower through a module-qualified
 // call, and networking.fin's `c_*` externs are not `#[global]`, so importing
 // them is refused in the frontend (see docs/guide/10-modules-and-imports.md).
-// The @defines below carry the exact same C ABI as networking.fin's.
+// Most local bindings mirror networking.fin. send/recv use the correct Linux
+// size_t/ssize_t ABI; legacy int-sized declarations must not be mixed with these.
 
 import { Collection } from collection::std;
-import { len, equals, clone, substr, trim, find, to_chars, from_chars, free_str } from strings::std;
+import { len, equals, clone, substr, find, to_chars, from_chars, free_str } from strings::std;
 
 namespace fin {
 
 // ---------------------------------------------------------------------------
-// Local C bindings (module-private). Same ABI as networking::std.
+// Local C bindings (module-private), targeting 64-bit Linux.
 // ---------------------------------------------------------------------------
 
 #[llvm_name="socket"]
@@ -39,11 +40,22 @@ namespace fin {
 #[llvm_name="getsockname"]
 @define z_getsockname(fd: int, addr: &int, len: &int) <int>;
 
+// Transport constants and errno binding below target Linux/POSIX sockets.
+// size_t/ssize_t use the native 64-bit ABI, not Fin int.
 #[llvm_name="send"]
-@define z_send(fd: int, buf: &char, len: int, flags: int) <int>;
+@define z_send(fd: int, buf: &char, len: ulong, flags: int) <long>;
 
 #[llvm_name="recv"]
-@define z_recv(fd: int, buf: &char, len: int, flags: int) <int>;
+@define z_recv(fd: int, buf: &char, len: ulong, flags: int) <long>;
+
+#[llvm_name="__errno_location"]
+@define z_errno() <&int>;
+
+// Functions rather than module constants: imported constants do not lower in
+// finc 0.4.0. Header size includes the final CRLFCRLF.
+fun z_max_headers() <int> { return 65536; }
+fun z_max_body() <int> { return 16777216; }
+fun z_max_fields() <int> { return 256; }
 
 #[llvm_name="close"]
 @define z_close(fd: int) <int>;
@@ -198,18 +210,6 @@ fun z_buf_free(b: &ZBuf) <noret> {
     delete b;
 }
 
-// Finds "\r\n\r\n" in the buffer; returns its start index or -1.
-fun z_find_headers_end(b: &ZBuf) <int> {
-    let i <int> = 0;
-    while (i + 4 <= b.len) {
-        if (b.data[i] == '\r' && b.data[i + 1] == '\n' && b.data[i + 2] == '\r' && b.data[i + 3] == '\n') {
-            return i;
-        }
-        i = i + 1;
-    }
-    return -1;
-}
-
 // ---------------------------------------------------------------------------
 // Internal: small helpers
 // ---------------------------------------------------------------------------
@@ -236,8 +236,8 @@ fun z_name_eq(a: string, b: string) <bool> {
     return same;
 }
 
-// Non-blaming unsigned parse; -1 on any invalid input or overflow past 65535.
-fun z_parse_uint(text: string) <int> {
+// Checked decimal parsing; ports and body lengths have independent limits.
+fun z_parse_decimal(text: string, limit: int) <int> {
     let bytes <[char]> = to_chars(text);
     let n <int> = len(text);
     if (n == 0) { delete bytes; return -1; }
@@ -245,31 +245,16 @@ fun z_parse_uint(text: string) <int> {
     for (let i <int> = 0; i < n; i++) {
         let c <char> = bytes[i];
         if (c < '0' || c > '9') { delete bytes; return -1; }
-        acc = acc * 10 + (cast<int>(c) - cast<int>('0'));
-        if (acc > 65535) { delete bytes; return -1; }
+        let d <int> = cast<int>(c) - cast<int>('0');
+        if (acc > (limit - d) / 10) { delete bytes; return -1; }
+        acc = acc * 10 + d;
     }
     delete bytes;
     return acc;
 }
 
-// Hex parse for chunk sizes; -1 on invalid.
-fun z_parse_hex(text: string) <int> {
-    let bytes <[char]> = to_chars(text);
-    let n <int> = len(text);
-    if (n == 0) { delete bytes; return -1; }
-    let acc <int> = 0;
-    for (let i <int> = 0; i < n; i++) {
-        let c <char> = bytes[i];
-        let d <int> = -1;
-        if (c >= '0' && c <= '9') { d = cast<int>(c) - cast<int>('0'); }
-        else if (c >= 'a' && c <= 'f') { d = cast<int>(c) - cast<int>('a') + 10; }
-        else if (c >= 'A' && c <= 'F') { d = cast<int>(c) - cast<int>('A') + 10; }
-        if (d < 0) { delete bytes; return -1; }
-        acc = acc * 16 + d;
-        if (acc > 16777216) { delete bytes; return -1; }
-    }
-    delete bytes;
-    return acc;
+fun z_parse_uint(text: string) <int> {
+    return z_parse_decimal(text, 65535);
 }
 
 fun z_itoa(v: int) <string> {
@@ -481,7 +466,9 @@ pub fun http_response(status: int, body: string) <&HttpResponse> {
         headers: http_new_headers(), body: clone(body)};
     http_header_set(r.headers, "Content-Type", "text/plain; charset=utf-8");
     let lens <string> = z_itoa(len(body));
-    http_header_set(r.headers, "Content-Length", lens);
+    if (status >= 200 && status != 204) {
+        http_header_set(r.headers, "Content-Length", lens);
+    }
     free_str(lens);
     return r;
 }
@@ -559,12 +546,27 @@ fun z_dial(host: string, port: int) <int> {
     return fd;
 }
 
+// Linux EINTR is 4; MSG_NOSIGNAL is 0x4000. Do not change process-wide
+// signal handlers: embedding applications retain ownership of their signals.
+fun z_recv_retry(fd: int, bytes: [char], n: int, flags: int) <int> {
+    while (true) {
+        let got <long> = z_recv(fd, &bytes[0], cast<ulong>(n), flags);
+        if (got >= 0) { return cast<int>(got); }
+        if (*z_errno() != 4) { return -1; }
+    }
+    return -1;
+}
+
 fun z_send_all(fd: int, bytes: [char], n: int) <bool> {
     let sent <int> = 0;
     while (sent < n) {
-        let got <int> = z_send(fd, &bytes[sent], n - sent, 0);
-        if (got <= 0) { return false; }
-        sent = sent + got;
+        let got <long> = z_send(fd, &bytes[sent], cast<ulong>(n - sent), 16384);
+        if (got < 0) {
+            if (*z_errno() == 4) { continue; }
+            return false;
+        }
+        if (got == 0) { return false; }
+        sent = sent + cast<int>(got);
     }
     return true;
 }
@@ -576,67 +578,76 @@ fun z_send_str(fd: int, s: string) <bool> {
     return ok;
 }
 
-// Reads until EOF or error. Returns null on read error.
+// Bounded close-delimited response body. One scratch allocation per read.
 fun z_read_all(fd: int) <&ZBuf> {
     let b <&ZBuf> = z_buf_new();
+    let chunk <[char]> = new [char, 8192]{};
     while (true) {
-        let chunk <[char]> = new [char, 8193]{};
-        let got <int> = z_recv(fd, &chunk[0], 8192, 0);
-        if (got < 0) {
+        let got <int> = z_recv_retry(fd, chunk, 8192, 0);
+        if (got < 0 || got > z_max_body() - b.len) {
             delete chunk;
             z_buf_free(b);
             return null;
         }
-        if (got == 0) {
-            delete chunk;
-            break;
-        }
+        if (got == 0) { break; }
         z_buf_append(b, chunk, got);
-        delete chunk;
     }
+    delete chunk;
     return b;
 }
 
-// Reads until "\r\n\r\n" is seen, EOF, or error. Returns null on error, or
-// when headers exceed 64 KiB. Any bytes already read past the header end stay
-// in the buffer for the caller.
+// Peek ahead, but consume only through CRLFCRLF. No body or protocol-upgrade
+// bytes are lost, including when the first WebSocket frame arrives with headers.
 fun z_read_headers(fd: int) <&ZBuf> {
     let b <&ZBuf> = z_buf_new();
-    while (true) {
-        if (z_find_headers_end(b) >= 0) { break; }
-        if (b.len > 65536) {
-            z_buf_free(b);
-            return null;
+    let chunk <[char]> = new [char, 4096]{};
+    let matched <int> = 0;
+    let done <bool> = false;
+    while (!done) {
+        let cap <int> = z_max_headers() - b.len;
+        if (cap > 4096) { cap = 4096; }
+        if (cap == 0) { delete chunk; z_buf_free(b); return null; }
+        let got <int> = z_recv_retry(fd, chunk, cap, 2); // MSG_PEEK
+        if (got <= 0) { delete chunk; z_buf_free(b); return null; }
+        let take <int> = got;
+        for (let i <int> = 0; i < got; i++) {
+            let c <char> = chunk[i];
+            if (c == cast<char>(0)) { delete chunk; z_buf_free(b); return null; }
+            if (matched == 0 || matched == 2) {
+                if (c == '\r') { matched++; } else { matched = 0; }
+            } else {
+                if (c == '\n') { matched++; }
+                else if (c == '\r') { matched = 1; }
+                else { matched = 0; }
+            }
+            if (matched == 4) { take = i + 1; done = true; break; }
         }
-        let chunk <[char]> = new [char, 4097]{};
-        let got <int> = z_recv(fd, &chunk[0], 4096, 0);
-        if (got <= 0) {
-            delete chunk;
-            z_buf_free(b);
-            return null;
+        // A single owner reads each connection. Partial recv is still legal.
+        let left <int> = take;
+        while (left > 0) {
+            let used <int> = z_recv_retry(fd, chunk, left, 0);
+            if (used <= 0) { delete chunk; z_buf_free(b); return null; }
+            z_buf_append(b, chunk, used);
+            left = left - used;
         }
-        z_buf_append(b, chunk, got);
-        delete chunk;
     }
+    delete chunk;
     return b;
 }
 
-// Reads exactly `want` more bytes into b. False on EOF/error.
+// Reads exactly `want` more bytes; callers enforce the appropriate size limit.
 fun z_read_exact(fd: int, b: &ZBuf, want: int) <bool> {
     let need <int> = want;
+    let chunk <[char]> = new [char, 8192]{};
     while (need > 0) {
         let cap <int> = 8192;
         if (need < cap) { cap = need; }
-        let chunk <[char]> = new [char, cap + 1]{};
-        let got <int> = z_recv(fd, &chunk[0], cap, 0);
-        if (got <= 0) {
-            delete chunk;
-            return false;
-        }
+        let got <int> = z_recv_retry(fd, chunk, cap, 0);
+        if (got <= 0) { delete chunk; return false; }
         z_buf_append(b, chunk, got);
-        delete chunk;
         need = need - got;
     }
+    delete chunk;
     return true;
 }
 
@@ -648,164 +659,277 @@ fun z_read_err(msg: string) <HttpReadResult> {
     return HttpReadResult{ok: false, req: null, err: clone(msg)};
 }
 
-// Parses one "Name: value" line; returns false when the line is malformed.
-fun z_parse_header_line(line: string, hdrs: &HttpHeaders) <bool> {
-    let colon <int> = find(line, ":");
-    if (colon < 0) { return false; }
-    let name <string> = trim(substr(line, 0, colon));
-    let value <string> = trim(substr(line, colon + 1, len(line) - colon - 1));
-    if (len(name) == 0) {
+fun z_token(c: char) <bool> {
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) { return true; }
+    return c == '!' || c == '#' || c == '$' || c == '%' || c == '&' ||
+        c == '\'' || c == '*' || c == '+' || c == '-' || c == '.' ||
+        c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
+}
+
+// Parse a byte span; only SP/HTAB are OWS. Whitespace before ':' and
+// obs-fold are invalid. Duplicate framing fields must never be overwritten.
+fun z_parse_field(bytes: [char], start: int, end: int, hdrs: &HttpHeaders, trailer: bool) <bool> {
+    let colon <int> = start;
+    while (colon < end && bytes[colon] != ':') {
+        if (!z_token(bytes[colon])) { return false; }
+        colon++;
+    }
+    if (colon == start || colon == end) { return false; }
+    let low <int> = colon + 1;
+    let high <int> = end;
+    for (let i <int> = low; i < high; i++) {
+        let c <char> = bytes[i];
+        if ((cast<int>(c) < 32 && c != '\t') || c == cast<char>(127)) { return false; }
+    }
+    while (low < high && (bytes[low] == ' ' || bytes[low] == '\t')) { low++; }
+    while (high > low && (bytes[high - 1] == ' ' || bytes[high - 1] == '\t')) { high--; }
+    let name <string> = from_chars(bytes, start, colon - start);
+    let framing <bool> = z_name_eq(name, "Content-Length") || z_name_eq(name, "Transfer-Encoding");
+    let singleton <bool> = framing || z_name_eq(name, "Host") ||
+        z_name_eq(name, "Sec-WebSocket-Key") || z_name_eq(name, "Sec-WebSocket-Version") ||
+        z_name_eq(name, "Sec-WebSocket-Accept");
+    if ((singleton && http_header_has(hdrs, name)) || (framing && trailer) ||
+        (trailer && (z_name_eq(name, "Host") || z_name_eq(name, "Connection") || z_name_eq(name, "Trailer")))) {
         free_str(name);
-        free_str(value);
         return false;
     }
+    let value <string> = from_chars(bytes, low, high - low);
     http_header_set(hdrs, name, value);
     free_str(name);
     free_str(value);
     return true;
 }
 
-// Parses header block text (lines separated by \r\n) into hdrs.
-fun z_parse_header_block(text: string, hdrs: &HttpHeaders) <noret> {
-    let pos <int> = 0;
+// Single byte scan: no remaining-block substr allocation for each field.
+// Any malformed line fails the whole message, not just that header.
+fun z_parse_header_block(text: string, hdrs: &HttpHeaders) <bool> {
+    let bytes <[char]> = to_chars(text);
     let total <int> = len(text);
+    let start <int> = 0;
+    let pos <int> = 0;
+    let count <int> = 0;
     while (pos < total) {
-        let eol <int> = find(substr(text, pos, total - pos), "\r\n");
-        let line <string> = null;
-        if (eol < 0) {
-            line = substr(text, pos, total - pos);
-            pos = total;
-        } else {
-            line = substr(text, pos, eol);
-            pos = pos + eol + 2;
-        }
-        if (len(line) > 0) {
-            z_parse_header_line(line, hdrs);
-        }
-        free_str(line);
+        if (bytes[pos] == '\n') { delete bytes; return false; }
+        if (bytes[pos] == '\r') {
+            if (pos + 1 >= total || bytes[pos + 1] != '\n' || count >= z_max_fields() ||
+                !z_parse_field(bytes, start, pos, hdrs, false)) { delete bytes; return false; }
+            count++;
+            pos = pos + 2;
+            start = pos;
+        } else { pos++; }
     }
+    if (start < total) {
+        if (count >= z_max_fields() || !z_parse_field(bytes, start, total, hdrs, false)) { delete bytes; return false; }
+    }
+    delete bytes;
+    return true;
 }
 
-// De-chunks a body starting at body_start in b. Returns a fresh buffer with
-// the decoded body, or null on malformed chunks.
-fun z_dechunk(b: &ZBuf, body_start: int) <&ZBuf> {
-    let out <&ZBuf> = z_buf_new();
-    let pos <int> = body_start;
-    while (true) {
-        // chunk-size line
-        let eol <int> = pos;
-        while (eol + 1 < b.len) {
-            if (b.data[eol] == '\r' && b.data[eol + 1] == '\n') { break; }
-            eol = eol + 1;
-        }
-        if (eol + 1 >= b.len) {
-            z_buf_free(out);
-            return null;
-        }
-        // strip chunk extensions after ';'
-        let semi <int> = pos;
-        while (semi < eol && b.data[semi] != ';') { semi = semi + 1; }
-        let sizetext <string> = from_chars(b.data, pos, semi - pos);
-        let size <int> = z_parse_hex(trim(sizetext));
-        free_str(sizetext);
-        if (size < 0) {
-            z_buf_free(out);
-            return null;
-        }
-        pos = eol + 2;
-        if (size == 0) {
-            break;
-        }
-        if (pos + size + 2 > b.len) {
-            z_buf_free(out);
-            return null;
-        }
-        z_buf_reserve(out, size);
-        for (let i <int> = 0; i < size; i++) {
-            out.data[out.len + i] = b.data[pos + i];
-        }
-        out.len = out.len + size;
-        pos = pos + size + 2; // skip trailing CRLF
+// -1 is invalid, -2 is chunked, -3 is close-delimited/absent.
+fun z_body_length(hdrs: &HttpHeaders, request: bool) <int> {
+    let te <bool> = http_header_has(hdrs, "Transfer-Encoding");
+    let cl <bool> = http_header_has(hdrs, "Content-Length");
+    if (te && cl) { return -1; }
+    if (te) {
+        if (request || !z_name_eq(http_header_get(hdrs, "Transfer-Encoding"), "chunked")) { return -1; }
+        return -2;
     }
-    return out;
+    if (cl) { return z_parse_decimal(http_header_get(hdrs, "Content-Length"), z_max_body()); }
+    return -3;
+}
+
+// Read one CRLF-terminated line without consuming following bytes.
+fun z_read_line(fd: int, b: &ZBuf, limit: int) <bool> {
+    let chunk <[char]> = new [char, 4096]{};
+    let cr <bool> = false;
+    let done <bool> = false;
+    while (!done) {
+        let cap <int> = limit - b.len;
+        if (cap > 4096) { cap = 4096; }
+        if (cap <= 0) { delete chunk; return false; }
+        let got <int> = z_recv_retry(fd, chunk, cap, 2);
+        if (got <= 0) { delete chunk; return false; }
+        let take <int> = got;
+        for (let i <int> = 0; i < got; i++) {
+            let c <char> = chunk[i];
+            if (c == cast<char>(0) || (cr && c != '\n') || (!cr && c == '\n')) { delete chunk; return false; }
+            if (cr) { take = i + 1; done = true; break; }
+            cr = c == '\r';
+        }
+        let left <int> = take;
+        while (left > 0) {
+            let used <int> = z_recv_retry(fd, chunk, left, 0);
+            if (used <= 0) { delete chunk; return false; }
+            z_buf_append(b, chunk, used);
+            left = left - used;
+        }
+    }
+    delete chunk;
+    return true;
+}
+
+// Strict size and token/quoted-string extension syntax, with checked arithmetic.
+fun z_chunk_size(line: &ZBuf) <int> {
+    let end <int> = line.len - 2;
+    let pos <int> = 0;
+    let size <int> = 0;
+    while (pos < end) {
+        let c <char> = line.data[pos];
+        let d <int> = -1;
+        if (c >= '0' && c <= '9') { d = cast<int>(c) - 48; }
+        else if (c >= 'a' && c <= 'f') { d = cast<int>(c) - 87; }
+        else if (c >= 'A' && c <= 'F') { d = cast<int>(c) - 55; }
+        if (d < 0) { break; }
+        if (size > (z_max_body() - d) / 16) { return -1; }
+        size = size * 16 + d;
+        pos++;
+    }
+    if (pos == 0) { return -1; }
+    while (pos < end) {
+        while (pos < end && (line.data[pos] == ' ' || line.data[pos] == '\t')) { pos++; }
+        if (pos >= end || line.data[pos] != ';') { return -1; }
+        pos++;
+        while (pos < end && (line.data[pos] == ' ' || line.data[pos] == '\t')) { pos++; }
+        let start <int> = pos;
+        while (pos < end && z_token(line.data[pos])) { pos++; }
+        if (pos == start) { return -1; }
+        while (pos < end && (line.data[pos] == ' ' || line.data[pos] == '\t')) { pos++; }
+        if (pos < end && line.data[pos] == '=') {
+            pos++;
+            while (pos < end && (line.data[pos] == ' ' || line.data[pos] == '\t')) { pos++; }
+            if (pos < end && line.data[pos] == '"') {
+                pos++;
+                let closed <bool> = false;
+                while (pos < end) {
+                    let c <char> = line.data[pos];
+                    pos++;
+                    if (c == '"') { closed = true; break; }
+                    if (c == '\\') {
+                        if (pos >= end) { return -1; }
+                        c = line.data[pos];
+                        pos++;
+                    }
+                    if ((cast<int>(c) < 32 && c != '\t') || c == cast<char>(127)) { return -1; }
+                }
+                if (!closed) { return -1; }
+            } else {
+                start = pos;
+                while (pos < end && z_token(line.data[pos])) { pos++; }
+                if (pos == start) { return -1; }
+            }
+        }
+    }
+    return size;
+}
+
+// Completion requires the zero chunk AND a valid terminated trailer section.
+fun z_read_chunked(fd: int) <&ZBuf> {
+    let body <&ZBuf> = z_buf_new();
+    let line <&ZBuf> = z_buf_new();
+    let trailers <&HttpHeaders> = http_new_headers();
+    let metadata <int> = 0;
+    let fields <int> = 0;
+    let terminal <bool> = false;
+    let ok <bool> = true;
+    while (true) {
+        line.len = 0;
+        let limit <int> = z_max_headers() - metadata;
+        if (limit > 8192) { limit = 8192; }
+        if (!z_read_line(fd, line, limit)) { ok = false; break; }
+        metadata = metadata + line.len;
+        if (terminal) {
+            if (line.len == 2) { break; }
+            if (fields >= z_max_fields() || !z_parse_field(line.data, 0, line.len - 2, trailers, true)) { ok = false; break; }
+            fields++;
+        } else {
+            let size <int> = z_chunk_size(line);
+            if (size < 0 || size > z_max_body() - body.len) { ok = false; break; }
+            if (size == 0) { terminal = true; continue; }
+            if (metadata > z_max_headers() - 2) { ok = false; break; }
+            metadata = metadata + 2;
+            if (!z_read_exact(fd, body, size)) { ok = false; break; }
+            line.len = 0;
+            if (!z_read_exact(fd, line, 2) || line.data[0] != '\r' || line.data[1] != '\n') { ok = false; break; }
+        }
+    }
+    http_free_headers(trailers);
+    z_buf_free(line);
+    if (!ok) { z_buf_free(body); return null; }
+    return body;
 }
 
 fun z_http_err(msg: string) <HttpResult> {
     return HttpResult{ok: false, status: 0, headers: null, body: "", err: clone(msg)};
 }
 
-// Parses a full response buffer into an HttpResult. `raw` is consumed.
-fun z_parse_response(raw: &ZBuf) <HttpResult> {
-    let hend <int> = z_find_headers_end(raw);
-    if (hend < 0) {
-        z_buf_free(raw);
-        return z_http_err("malformed response: no header terminator");
+// The first line ends at CRLF; a headerless message is legal.
+fun z_first_line(raw: &ZBuf) <int> {
+    for (let i <int> = 0; i + 1 < raw.len; i++) {
+        if (raw.data[i] == '\r' && raw.data[i + 1] == '\n') { return i; }
+        if (raw.data[i] == '\r' || raw.data[i] == '\n' || cast<int>(raw.data[i]) < 32 || raw.data[i] == cast<char>(127)) { return -1; }
     }
-    let head <string> = from_chars(raw.data, 0, hend);
-    let eol <int> = find(head, "\r\n");
-    if (eol < 0) {
-        free_str(head);
-        z_buf_free(raw);
-        return z_http_err("malformed response: no status line");
-    }
-    let status_line <string> = substr(head, 0, eol);
-    let rest <string> = substr(head, eol + 2, len(head) - eol - 2);
-    free_str(head);
-    // status line: HTTP/1.1 200 OK
-    let sp1 <int> = find(status_line, " ");
-    if (sp1 < 0) {
-        free_str(status_line);
-        free_str(rest);
-        z_buf_free(raw);
-        return z_http_err("malformed status line");
-    }
-    let after <string> = substr(status_line, sp1 + 1, len(status_line) - sp1 - 1);
-    free_str(status_line);
-    let sp2 <int> = find(after, " ");
-    let codetext <string> = null;
-    if (sp2 < 0) {
-        codetext = clone(after);
-    } else {
-        codetext = substr(after, 0, sp2);
-    }
-    free_str(after);
-    let status <int> = z_parse_uint(trim(codetext));
-    free_str(codetext);
-    if (status <= 0) {
-        free_str(rest);
-        z_buf_free(raw);
-        return z_http_err("malformed status code");
-    }
-    let hdrs <&HttpHeaders> = http_new_headers();
-    z_parse_header_block(rest, hdrs);
-    free_str(rest);
-    let body_start <int> = hend + 4;
-    let body <string> = "";
-    let has_te <bool> = http_header_has(hdrs, "Transfer-Encoding");
-    let has_cl <bool> = http_header_has(hdrs, "Content-Length");
-    if (has_te && z_name_eq(http_header_get(hdrs, "Transfer-Encoding"), "chunked")) {
-        let decoded <&ZBuf> = z_dechunk(raw, body_start);
-        z_buf_free(raw);
-        if (decoded == null) {
-            http_free_headers(hdrs);
-            return z_http_err("malformed chunked body");
+    return -1;
+}
+
+// Read one framed response. Skip bounded informational responses; this GET/POST
+// client does not support 101 (the raw server API supports upgrades).
+fun z_read_response(fd: int) <HttpResult> {
+    let interim <int> = 0;
+    while (true) {
+        let raw <&ZBuf> = z_read_headers(fd);
+        if (raw == null) { return z_http_err("cannot read response headers (invalid or >64KiB)"); }
+        let eol <int> = z_first_line(raw);
+        let valid <bool> = eol >= 13;
+        let status <int> = 0;
+        if (valid) {
+            let prefix <string> = from_chars(raw.data, 0, 9);
+            valid = equals(prefix, "HTTP/1.1 ") || equals(prefix, "HTTP/1.0 ");
+            free_str(prefix);
+            if (raw.data[12] != ' ') { valid = false; }
+            let code <string> = from_chars(raw.data, 9, 3);
+            status = z_parse_decimal(code, 999);
+            free_str(code);
+            if (status < 100) { valid = false; }
         }
-        body = z_buf_to_string(decoded);
-        z_buf_free(decoded);
-    } else if (has_cl) {
-        let want <int> = z_parse_uint(trim(http_header_get(hdrs, "Content-Length")));
-        if (want < 0 || body_start + want > raw.len) {
-            z_buf_free(raw);
-            http_free_headers(hdrs);
-            return z_http_err("body shorter than Content-Length");
+        let hdrs <&HttpHeaders> = http_new_headers();
+        if (valid) {
+            let rest <string> = from_chars(raw.data, eol + 2, raw.len - eol - 4);
+            valid = z_parse_header_block(rest, hdrs);
+            free_str(rest);
         }
-        body = from_chars(raw.data, body_start, want);
         z_buf_free(raw);
-    } else {
-        body = from_chars(raw.data, body_start, raw.len - body_start);
-        z_buf_free(raw);
+        let want <int> = z_body_length(hdrs, false);
+        if (!valid || want == -1 || status == 101 || (status < 200 && interim >= 16)) {
+            http_free_headers(hdrs);
+            return z_http_err("malformed or unsupported response framing");
+        }
+        if (status < 200 || status == 204) {
+            if (http_header_has(hdrs, "Content-Length") || http_header_has(hdrs, "Transfer-Encoding")) {
+                http_free_headers(hdrs);
+                return z_http_err("framing forbidden for this response status");
+            }
+            if (status < 200) { http_free_headers(hdrs); interim++; continue; }
+        }
+        let body <&ZBuf> = null;
+        if (status == 204 || status == 304) {
+            body = z_buf_new();
+        } else if (want == -2) {
+            body = z_read_chunked(fd);
+        } else if (want >= 0) {
+            body = z_buf_new();
+            if (!z_read_exact(fd, body, want)) { z_buf_free(body); body = null; }
+        } else {
+            body = z_read_all(fd);
+        }
+        if (body == null) {
+            http_free_headers(hdrs);
+            return z_http_err("invalid, incomplete, or oversized response body");
+        }
+        let text <string> = z_buf_to_string(body);
+        z_buf_free(body);
+        return HttpResult{ok: true, status: status, headers: hdrs, body: text, err: ""};
     }
-    return HttpResult{ok: true, status: status, headers: hdrs, body: body, err: ""};
+    return z_http_err("cannot read response");
 }
 
 // ---------------------------------------------------------------------------
@@ -865,12 +989,9 @@ fun z_http_do(method: string, url: string, content_type: string, body: string, h
         return z_http_err("send failed");
     }
     z_buf_free(req);
-    let raw <&ZBuf> = z_read_all(fd);
+    let result <HttpResult> = z_read_response(fd);
     z_close(fd);
-    if (raw == null) {
-        return z_http_err("read failed");
-    }
-    return z_parse_response(raw);
+    return result;
 }
 
 #[export]
@@ -929,8 +1050,12 @@ pub fun http_accept(srv: &HttpServer) <&HttpConn> {
     let peer <[int]> = new [int, 4]{};
     let peerlen <int> = 16;
     let fd <int> = z_accept(srv.fd, &peer[0], &peerlen);
-    blame fd >= 0, "http_accept: cannot accept connection";
+    while (fd < 0 && *z_errno() == 4) {
+        peerlen = 16;
+        fd = z_accept(srv.fd, &peer[0], &peerlen);
+    }
     delete peer;
+    blame fd >= 0, "http_accept: cannot accept connection";
     return new HttpConn{fd: fd};
 }
 
@@ -940,17 +1065,13 @@ pub fun http_read_request(conn: &HttpConn) <HttpReadResult> {
     if (raw == null) {
         return z_read_err("cannot read request headers (EOF, error, or headers > 64KiB)");
     }
-    let hend <int> = z_find_headers_end(raw);
-    let head <string> = from_chars(raw.data, 0, hend);
-    let eol <int> = find(head, "\r\n");
+    let eol <int> = z_first_line(raw);
     if (eol < 0) {
-        free_str(head);
         z_buf_free(raw);
-        return z_read_err("malformed request: no request line");
+        return z_read_err("malformed request line");
     }
-    let request_line <string> = substr(head, 0, eol);
-    let rest <string> = substr(head, eol + 2, len(head) - eol - 2);
-    free_str(head);
+    let request_line <string> = from_chars(raw.data, 0, eol);
+    let rest <string> = from_chars(raw.data, eol + 2, raw.len - eol - 4);
     let sp1 <int> = find(request_line, " ");
     if (sp1 < 0) {
         free_str(request_line);
@@ -970,44 +1091,37 @@ pub fun http_read_request(conn: &HttpConn) <HttpReadResult> {
         return z_read_err("malformed request line");
     }
     let target <string> = substr(after, 0, sp2);
-    let version <string> = trim(substr(after, sp2 + 1, len(after) - sp2 - 1));
+    let version <string> = substr(after, sp2 + 1, len(after) - sp2 - 1);
     free_str(after);
-    let hdrs <&HttpHeaders> = http_new_headers();
-    z_parse_header_block(rest, hdrs);
-    free_str(rest);
-    // body (always malloc'd so ownership is uniform: free unconditionally)
-    let body <string> = clone("");
-    if (http_header_has(hdrs, "Content-Length")) {
-        let want <int> = z_parse_uint(trim(http_header_get(hdrs, "Content-Length")));
-        if (want < 0) {
-            z_buf_free(raw);
-            http_free_headers(hdrs);
-            free_str(method);
-            free_str(target);
-            free_str(version);
-            return z_read_err("invalid Content-Length");
-        }
-        if (want > 16777216) {
-            z_buf_free(raw);
-            http_free_headers(hdrs);
-            free_str(method);
-            free_str(target);
-            free_str(version);
-            return z_read_err("request body too large (> 16MiB)");
-        }
-        let have <int> = raw.len - (hend + 4);
-        if (have < want) {
-            if (!z_read_exact(conn.fd, raw, want - have)) {
-                z_buf_free(raw);
-                http_free_headers(hdrs);
-                free_str(method);
-                free_str(target);
-                free_str(version);
-                return z_read_err("body shorter than Content-Length");
-            }
-        }
-        body = from_chars(raw.data, hend + 4, want);
+    let valid <bool> = len(method) > 0 && len(target) > 0 &&
+        (equals(version, "HTTP/1.1") || equals(version, "HTTP/1.0"));
+    let mb <[char]> = to_chars(method);
+    for (let i <int> = 0; i < len(method); i++) {
+        if (!z_token(mb[i])) { valid = false; }
     }
+    delete mb;
+    let hdrs <&HttpHeaders> = http_new_headers();
+    if (!z_parse_header_block(rest, hdrs)) { valid = false; }
+    free_str(rest);
+    let want <int> = z_body_length(hdrs, true);
+    if (!valid || want == -1) {
+        z_buf_free(raw);
+        http_free_headers(hdrs);
+        free_str(method);
+        free_str(target);
+        free_str(version);
+        return z_read_err("malformed request or unsupported framing");
+    }
+    raw.len = 0;
+    if (want > 0 && !z_read_exact(conn.fd, raw, want)) {
+        z_buf_free(raw);
+        http_free_headers(hdrs);
+        free_str(method);
+        free_str(target);
+        free_str(version);
+        return z_read_err("body shorter than Content-Length");
+    }
+    let body <string> = z_buf_to_string(raw);
     z_buf_free(raw);
     let req <&HttpRequest> = new HttpRequest{method: method, target: target, version: version,
                                             headers: hdrs, body: body};
@@ -1025,16 +1139,19 @@ pub fun http_write_response(conn: &HttpConn, resp: &HttpResponse) <bool> {
     z_buf_append_str(out, http_status_text(resp.status));
     z_buf_append_str(out, "\r\n");
     let n <int> = http_header_count(resp.headers);
+    let no_body <bool> = resp.status < 200 || resp.status == 204 || resp.status == 304;
     let has_length <bool> = false;
     for (let i <int> = 0; i < n; i++) {
         let hname <string> = http_header_name(resp.headers, i);
+        if ((resp.status < 200 || resp.status == 204) &&
+            (z_name_eq(hname, "Content-Length") || z_name_eq(hname, "Transfer-Encoding"))) { continue; }
         z_buf_append_str(out, hname);
         z_buf_append_str(out, ": ");
         z_buf_append_str(out, http_header_value(resp.headers, i));
         z_buf_append_str(out, "\r\n");
         if (z_name_eq(hname, "Content-Length")) { has_length = true; }
     }
-    if (!has_length) {
+    if (!has_length && !no_body) {
         z_buf_append_str(out, "Content-Length: ");
         let lens <string> = z_itoa(len(resp.body));
         z_buf_append_str(out, lens);
@@ -1042,7 +1159,7 @@ pub fun http_write_response(conn: &HttpConn, resp: &HttpResponse) <bool> {
         z_buf_append_str(out, "\r\n");
     }
     z_buf_append_str(out, "Connection: close\r\n\r\n");
-    if (resp.body != null) {
+    if (resp.body != null && !no_body) {
         z_buf_append_str(out, resp.body);
     }
     let ok <bool> = z_send_all(conn.fd, out.data, out.len);
@@ -1057,8 +1174,19 @@ pub fun http_write_raw(conn: &HttpConn, text: string) <bool> {
     return z_send_str(conn.fd, text);
 }
 
+// Transfer fd ownership to the caller, freeing only the connection wrapper.
+// The caller must eventually close the returned fd; conn is invalid afterwards.
 #[export]
-pub fun http_close(conn: &HttpConn) <noret> {    if (conn == null) { return; }
+pub fun http_detach(conn: &HttpConn) <int> {
+    if (conn == null) { return -1; }
+    let fd <int> = conn.fd;
+    delete conn;
+    return fd;
+}
+
+#[export]
+pub fun http_close(conn: &HttpConn) <noret> {
+    if (conn == null) { return; }
     z_close(conn.fd);
     delete conn;
 }

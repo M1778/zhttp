@@ -19,8 +19,6 @@ import { free_str, equals, len } from strings::std;
 @define t_getenv(name: string) <string>;
 #[llvm_name="atoi"]
 @define t_atoi(text: string) <int>;
-#[llvm_name="recv"]
-@define t_recv(fd: int, bytes: &char, size: ulong, flags: int) <long>;
 
 // Public-API driver for test_protocol.py's adversarial TCP/socketpair peers.
 // The ordinary test entry point remains unchanged when ZHTTP_TEST_MODE is absent.
@@ -63,9 +61,9 @@ fun protocol_driver(mode: string) <noret> {
     else { printf("REJECT\n"); }
     http_free_read_result(&rr);
     if (equals(mode, "upgrade")) {
-        let fd <int> = http_detach(conn);
+        let fd <HttpSocket> = http_detach(conn);
         let bytes <[char]> = new [char, 4]{};
-        let got <long> = t_recv(fd, &bytes[0], cast<ulong>(4), 0);
+        let got <int> = http_socket_read(fd, bytes, 4);
         assert_true(got == 4 && bytes[0] == 'T' && bytes[1] == 'A' && bytes[2] == 'I' && bytes[3] == 'L', "upgrade tail preserved");
         delete bytes;
         http_socket_close(fd);

@@ -32,20 +32,23 @@ type ZAddrLen = int;
 #[llvm_name="WSACleanup"] @define z_cleanup() <int>;
 #[llvm_name="WSAGetLastError"] @define z_last_error() <int>;
 #[llvm_name="closesocket"] @define z_native_close(fd: HttpSocket) <int>;
-#[llvm_name="setsockopt"] @define z_setsockopt(fd: HttpSocket, level: int, option: int, value: &char, size: int) <int>;
 #c_else
 #[export] pub type HttpSocket = int;
 type ZSize = ulong;
 type ZCount = long;
 type ZAddrLen = uint;
 #[llvm_name="close"] @define z_native_close(fd: HttpSocket) <int>;
-#[llvm_name="setsockopt"] @define z_setsockopt(fd: HttpSocket, level: int, option: int, value: &char, size: uint) <int>;
 #c_ifdef FIN_TARGET_DARWIN
 #[llvm_name="__error"] @define z_errno() <&int>;
 #c_else
 #[llvm_name="__errno_location"] @define z_errno() <&int>;
 #c_endif
 #c_endif
+
+// setsockopt's length argument is a socklen_t on every platform, so it does
+// not follow the send-buffer width.
+#[llvm_name="setsockopt"]
+@define z_setsockopt(fd: HttpSocket, level: int, option: int, value: &char, size: uint) <int>;
 
 #[llvm_name="socket"]
 @define z_socket(domain: int, kind: int, protocol: int) <HttpSocket>;
@@ -111,7 +114,7 @@ fun z_interrupted() <bool> {
 fun z_no_sigpipe(fd: HttpSocket) <bool> {
     #c_ifdef FIN_TARGET_DARWIN
     let one <char> = cast<char>(1);
-    let status <int> = z_setsockopt(fd, 65535, 4130, &one, cast<ZSize>(4)); // SO_NOSIGPIPE
+    let status <int> = z_setsockopt(fd, 65535, 4130, &one, cast<uint>(4)); // SO_NOSIGPIPE
     return status == 0;
     #c_else
     return true;

@@ -277,6 +277,11 @@ with peer_for(None) as listener:
             p.communicate()
 # Fault injection is isolated to this subprocess; no process-global handlers.
 # Each syscall gets EINTR once, then short send/recv counts exercise retry loops.
+#
+# Linux only: the shim interposes send, recv and accept through LD_PRELOAD,
+# which has no equivalent on Windows or macOS. The cases above it do not depend
+# on it, so the suite still runs everywhere -- one fewer case on the other
+# platforms, and the report says which.
 SHIM = r'''
 #define _GNU_SOURCE
 #include <sys/socket.h>
@@ -301,17 +306,21 @@ int accept(int fd, struct sockaddr *a, socklen_t *n) {
     return real(fd, a, n);
 }
 '''
-with tempfile.TemporaryDirectory(prefix="zhttp-syscalls-") as temp:
-    source = os.path.join(temp, "syscalls.c")
-    shared = os.path.join(temp, "syscalls.so")
-    with open(source, "w", encoding="utf-8") as f:
-        f.write(SHIM)
-    subprocess.run([os.environ.get("CC", "cc"), "-shared", "-fPIC", source, "-ldl", "-o", shared], check=True)
-    env = dict(os.environ, LD_PRELOAD=shared)
-    env.pop("ZHTTP_TEST_MODE", None)
-    injected = subprocess.run([BINARY], env=env, capture_output=True, timeout=15)
-    assert injected.returncode == 0, (injected.stdout, injected.stderr)
-    assert b"zhttp: all tests passed" in injected.stdout
-    COUNT += 1
-    print("PASS EINTR and short send/recv during baseline loopback")
+if sys.platform.startswith("linux"):
+    with tempfile.TemporaryDirectory(prefix="zhttp-syscalls-") as temp:
+        source = os.path.join(temp, "syscalls.c")
+        shared = os.path.join(temp, "syscalls.so")
+        with open(source, "w", encoding="utf-8") as f:
+            f.write(SHIM)
+        subprocess.run([os.environ.get("CC", "cc"), "-shared", "-fPIC", source, "-ldl", "-o", shared], check=True)
+        env = dict(os.environ, LD_PRELOAD=shared)
+        env.pop("ZHTTP_TEST_MODE", None)
+        injected = subprocess.run([BINARY], env=env, capture_output=True, timeout=15)
+        assert injected.returncode == 0, (injected.stdout, injected.stderr)
+        assert b"zhttp: all tests passed" in injected.stdout
+        COUNT += 1
+        print("PASS EINTR and short send/recv during baseline loopback")
+else:
+    print("SKIP EINTR and short send/recv during baseline loopback "
+          "(the LD_PRELOAD shim is Linux-only)")
 print(f"zhttp protocol: {COUNT} cases passed")

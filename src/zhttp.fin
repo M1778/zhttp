@@ -10,58 +10,138 @@
 // networking::std: only `#[global]` externs lower through a module-qualified
 // call, and networking.fin's `c_*` externs are not `#[global]`, so importing
 // them is refused in the frontend (see docs/guide/10-modules-and-imports.md).
-// Most local bindings mirror networking.fin. send/recv use the correct Linux
-// size_t/ssize_t ABI; legacy int-sized declarations must not be mixed with these.
+// Most local bindings mirror networking.fin. send/recv use the correct
+// size_t/ssize_t (POSIX) or int (Winsock) ABI; legacy int-sized POSIX
+// declarations must not be mixed with these.
 
 import { Collection } from collection::std;
 import { len, equals, clone, substr, find, to_chars, from_chars, free_str } from strings::std;
 
 namespace fin {
 
-// ---------------------------------------------------------------------------
-// Local C bindings (module-private), targeting 64-bit Linux.
-// ---------------------------------------------------------------------------
+// Shared native socket ABI. WebSocket and test peers use the exported helpers
+// below, never redeclare send/recv with incompatible signatures. Selected at
+// compile time from the native target (ADR 0051 addendum); Linux is the only
+// target this repository has executed, macOS/Windows are compiled-only.
+#c_ifdef FIN_TARGET_WINDOWS
+#[export] pub type HttpSocket = ulong; // Winsock SOCKET is UINT_PTR, not int.
+type ZSize = int;
+type ZCount = int;
+type ZAddrLen = int;
+#[llvm_name="WSAStartup"] @define z_startup(version: ushort, data: &void) <int>;
+#[llvm_name="WSACleanup"] @define z_cleanup() <int>;
+#[llvm_name="WSAGetLastError"] @define z_last_error() <int>;
+#[llvm_name="closesocket"] @define z_native_close(fd: HttpSocket) <int>;
+#[llvm_name="setsockopt"] @define z_setsockopt(fd: HttpSocket, level: int, option: int, value: &char, size: int) <int>;
+#c_else
+#[export] pub type HttpSocket = int;
+type ZSize = ulong;
+type ZCount = long;
+type ZAddrLen = uint;
+#[llvm_name="close"] @define z_native_close(fd: HttpSocket) <int>;
+#[llvm_name="setsockopt"] @define z_setsockopt(fd: HttpSocket, level: int, option: int, value: &char, size: uint) <int>;
+#c_ifdef FIN_TARGET_DARWIN
+#[llvm_name="__error"] @define z_errno() <&int>;
+#c_else
+#[llvm_name="__errno_location"] @define z_errno() <&int>;
+#c_endif
+#c_endif
 
 #[llvm_name="socket"]
-@define z_socket(domain: int, kind: int, protocol: int) <int>;
-
+@define z_socket(domain: int, kind: int, protocol: int) <HttpSocket>;
 #[llvm_name="connect"]
-@define z_connect(fd: int, addr: &int, len: int) <int>;
-
+@define z_connect(fd: HttpSocket, addr: &int, len: ZAddrLen) <int>;
 #[llvm_name="bind"]
-@define z_bind(fd: int, addr: &int, len: int) <int>;
-
+@define z_bind(fd: HttpSocket, addr: &int, len: ZAddrLen) <int>;
 #[llvm_name="listen"]
-@define z_listen(fd: int, backlog: int) <int>;
-
+@define z_listen(fd: HttpSocket, backlog: int) <int>;
 #[llvm_name="accept"]
-@define z_accept(fd: int, addr: &int, len: &int) <int>;
-
+@define z_accept(fd: HttpSocket, addr: &int, len: &ZAddrLen) <HttpSocket>;
 #[llvm_name="getsockname"]
-@define z_getsockname(fd: int, addr: &int, len: &int) <int>;
-
-// Transport constants and errno binding below target Linux/POSIX sockets.
-// size_t/ssize_t use the native 64-bit ABI, not Fin int.
+@define z_getsockname(fd: HttpSocket, addr: &int, len: &ZAddrLen) <int>;
 #[llvm_name="send"]
-@define z_send(fd: int, buf: &char, len: ulong, flags: int) <long>;
-
+@define z_send(fd: HttpSocket, buf: &char, len: ZSize, flags: int) <ZCount>;
 #[llvm_name="recv"]
-@define z_recv(fd: int, buf: &char, len: ulong, flags: int) <long>;
+@define z_recv(fd: HttpSocket, buf: &char, len: ZSize, flags: int) <ZCount>;
+#[llvm_name="shutdown"]
+@define z_shutdown(fd: HttpSocket, how: int) <int>;
 
-#[llvm_name="__errno_location"]
-@define z_errno() <&int>;
+// WSAStartup version requested by every acquisition, and the error a failed
+// Winsock call reports. On POSIX these are inert; `z_last_error` is only read
+// after a failed call on Windows, where errno is not the socket error.
+fun z_wsa_version() <int> { return 514; } // MAKEWORD(2, 2): Winsock 2.2.
+
+// One WSA reference per created/accepted socket. Each successful acquisition is
+// balanced by exactly one z_release, called by whichever side closes that socket
+// (http_socket_close or http_close/http_server_close via z_acquire). Detach
+// transfers both the handle and its reference to the caller.
+fun z_acquire() <bool> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    // WSADATA is 408 bytes on Win64; long storage also gives pointer alignment.
+    let data <[long]> = new [long, 51]{};
+    let status <int> = z_startup(cast<ushort>(z_wsa_version()), &data[0]);
+    let version <int> = cast<int>(cast<ulong>(data[0]) % cast<ulong>(65536));
+    delete data;
+    if (status != 0) { return false; } // WSAStartup returns its own error.
+    if (version != z_wsa_version()) { z_cleanup(); return false; }
+    #c_endif
+    return true;
+}
+fun z_release() <bool> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    return z_cleanup() == 0;
+    #c_else
+    return true;
+    #c_endif
+}
+fun z_interrupted() <bool> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    return z_last_error() == 10004; // WSAEINTR
+    #c_else
+    return *z_errno() == 4; // EINTR on Linux and Darwin
+    #c_endif
+}
+
+// SIGPIPE policy, selected per target and never silently dropped:
+//   Linux  - MSG_NOSIGNAL in z_send_flags().
+//   macOS  - SO_NOSIGPIPE on the descriptor: Darwin has no MSG_NOSIGNAL.
+//   Windows- not applicable; send() reports WSAECONNRESET/WSAECONNABORTED.
+// A failed setsockopt is reported by http_* calls that create sockets, not
+// ignored: a Darwin caller must not risk process termination on a reset peer.
+fun z_no_sigpipe(fd: HttpSocket) <bool> {
+    #c_ifdef FIN_TARGET_DARWIN
+    let one <char> = cast<char>(1);
+    let status <int> = z_setsockopt(fd, 65535, 4130, &one, cast<ZSize>(4)); // SO_NOSIGPIPE
+    return status == 0;
+    #c_else
+    return true;
+    #c_endif
+}
+#c_ifdef FIN_TARGET_LINUX
+fun z_send_flags() <int> { return 16384; } // MSG_NOSIGNAL; leave handlers alone.
+#c_else
+fun z_send_flags() <int> { return 0; }
+#c_endif
+#[export]
+pub fun http_socket_invalid() <HttpSocket> { return cast<HttpSocket>(-1); }
+#[export]
+pub fun http_socket_close(fd: HttpSocket) <bool> {
+    if (fd == http_socket_invalid()) { return false; }
+    // Never retry close on EINTR: Linux may already have released/reused the fd.
+    if (z_native_close(fd) != 0) { return false; }
+    return z_release();
+}
+#[export]
+pub fun http_socket_shutdown(fd: HttpSocket) <bool> { return z_shutdown(fd, 2) == 0; }
 
 // Functions rather than module constants: imported constants do not lower in
-// finc 0.4.0. Header size includes the final CRLFCRLF.
+// the frozen fallback. Header size includes the final CRLFCRLF.
 fun z_max_headers() <int> { return 65536; }
 fun z_max_body() <int> { return 16777216; }
 fun z_max_fields() <int> { return 256; }
 
-#[llvm_name="close"]
-@define z_close(fd: int) <int>;
-
 #[llvm_name="inet_addr"]
-@define z_inet_addr(cp: string) <int>;
+@define z_inet_addr(cp: string) <uint>;
 
 #[llvm_name="calloc"]
 @define z_calloc(count: ulong, size: ulong) <string>;
@@ -143,13 +223,13 @@ pub struct HttpReadResult {
 #[export]
 pub struct HttpServer {
     pub:
-        fd <int>,
+        fd <HttpSocket>,
 }
 
 #[export]
 pub struct HttpConn {
     pub:
-        fd <int>,
+        fd <HttpSocket>,
 }
 
 // ---------------------------------------------------------------------------
@@ -522,64 +602,104 @@ pub fun http_free_result(r: &HttpResult) <noret> {
 // Internal: TCP plumbing
 // ---------------------------------------------------------------------------
 
-fun z_sockaddr(host: string, port: int) <[int]> {
-    let a <int> = z_inet_addr(host);
-    blame a != -1, "cannot parse the address as a dotted quad";
+// sockaddr_in is its sixteen bytes in an `[int, 4]`: sin_family, sin_port in
+// network order, then sin_addr as inet_addr answered it. Darwin's sockaddr has
+// a leading sin_len octet, so the family word carries the length as well:
+// sin_len is 16 and sin_family is AF_INET, which as one little-endian word is
+// 16 | (2 << 8) = 528, so the Darwin branch adds 526 to the 2 the other
+// targets use. Linux and Winsock's sockaddr_in start at sin_family. Fields sit
+// at the same offsets on all three targets, so one layout serves them all.
+#[export]
+pub fun http_sockaddr(host: string, port: int) <[int]> {
+    let a <uint> = z_inet_addr(host);
+    blame a != cast<uint>(-1), "cannot parse the address as a dotted quad";
     let addr <[int]> = new [int, 4]{};
     addr[0] = cast<int>(2 + cast<long>(port / 256) * 65536 +
                         cast<long>(port % 256) * 16777216);
-    addr[1] = a;
+    #c_ifdef FIN_TARGET_DARWIN
+    addr[0] = addr[0] + 526; // sin_len 16 | (AF_INET 2 << 8)
+    #c_endif
+    addr[1] = cast<int>(a);
     return addr;
 }
 
-// Returns a connected fd, or -1 on any failure (never blames).
-fun z_dial(host: string, port: int) <int> {
-    if (port <= 0 || port > 65535) { return -1; }
-    let a <int> = z_inet_addr(host);
-    if (a == -1) { return -1; }
-    let addr <[int]> = z_sockaddr(host, port);
-    let fd <int> = z_socket(2, 1, 0);
-    if (fd < 0) { delete addr; return -1; }
-    let err <int> = z_connect(fd, &addr[0], 16);
+// Winsock reports failures through WSAGetLastError, POSIX through errno.
+// Every retry/close decision goes through this so no target reads the wrong
+// error source.
+#[export]
+pub fun http_socket_failed() <bool> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    return z_last_error() != 0;
+    #c_else
+    return *z_errno() != 0;
+    #c_endif
+}
+
+// True when the last socket call failed because it was interrupted; blocking
+// calls retry then and only then.
+#[export]
+pub fun http_socket_interrupted() <bool> { return z_interrupted(); }
+
+// A connected blocking socket. Returns the invalid handle on failure; no
+// blame, because a refused connection is a value the caller reports.
+#[export]
+pub fun http_socket_dial(host: string, port: int) <HttpSocket> {
+    if (port <= 0 || port > 65535) { return http_socket_invalid(); }
+    let a <uint> = z_inet_addr(host);
+    if (a == cast<uint>(-1)) { return http_socket_invalid(); }
+    let addr <[int]> = http_sockaddr(host, port);
+    if (!z_acquire()) { delete addr; return http_socket_invalid(); }
+    let fd <HttpSocket> = z_socket(2, 1, 0);
+    if (fd == http_socket_invalid()) { delete addr; z_release(); return http_socket_invalid(); }
+    let err <int> = z_connect(fd, &addr[0], cast<ZAddrLen>(16));
     delete addr;
-    if (err != 0) { z_close(fd); return -1; }
+    if (err != 0 || !z_no_sigpipe(fd)) {
+        z_native_close(fd);
+        z_release();
+        return http_socket_invalid();
+    }
     return fd;
 }
 
-// Linux EINTR is 4; MSG_NOSIGNAL is 0x4000. Do not change process-wide
-// signal handlers: embedding applications retain ownership of their signals.
-fun z_recv_retry(fd: int, bytes: [char], n: int, flags: int) <int> {
+// EINTR (4 on Linux and Darwin) and WSAEINTR (10004) are the only errors a
+// blocking call retries. Do not change process-wide signal handlers: embedding
+// applications retain ownership of their signals.
+fun z_recv_retry(fd: HttpSocket, bytes: [char], n: int, flags: int) <int> {
     while (true) {
-        let got <long> = z_recv(fd, &bytes[0], cast<ulong>(n), flags);
-        if (got >= 0) { return cast<int>(got); }
-        if (*z_errno() != 4) { return -1; }
+        let got <ZCount> = z_recv(fd, &bytes[0], cast<ZSize>(n), flags);
+        if (got >= cast<ZCount>(0)) { return cast<int>(got); }
+        if (!z_interrupted()) { return -1; }
     }
     return -1;
 }
 
-fun z_send_all(fd: int, bytes: [char], n: int) <bool> {
+fun z_send_all(fd: HttpSocket, bytes: [char], n: int) <bool> {
     let sent <int> = 0;
     while (sent < n) {
-        let got <long> = z_send(fd, &bytes[sent], cast<ulong>(n - sent), 16384);
-        if (got < 0) {
-            if (*z_errno() == 4) { continue; }
+        let got <ZCount> = z_send(fd, &bytes[sent], cast<ZSize>(n - sent), z_send_flags());
+        if (got < cast<ZCount>(0)) {
+            if (z_interrupted()) { continue; }
             return false;
         }
-        if (got == 0) { return false; }
+        if (got == cast<ZCount>(0)) { return false; }
         sent = sent + cast<int>(got);
     }
     return true;
 }
 
-fun z_send_str(fd: int, s: string) <bool> {
+fun z_send_str(fd: HttpSocket, s: string) <bool> {
     let bytes <[char]> = to_chars(s);
     let ok <bool> = z_send_all(fd, bytes, len(s));
     delete bytes;
     return ok;
 }
 
-// Bounded close-delimited response body. One scratch allocation per read.
-fun z_read_all(fd: int) <&ZBuf> {
+// MSG_PEEK is 2 on Linux and Darwin; Winsock spells the same flag MSG_PEEK as
+// well, so the value is portable. Kept as one function so a target that ever
+// disagrees has a single place to change.
+fun z_peek_flag() <int> { return 2; }
+
+fun z_read_all(fd: HttpSocket) <&ZBuf> {
     let b <&ZBuf> = z_buf_new();
     let chunk <[char]> = new [char, 8192]{};
     while (true) {
@@ -596,9 +716,7 @@ fun z_read_all(fd: int) <&ZBuf> {
     return b;
 }
 
-// Peek ahead, but consume only through CRLFCRLF. No body or protocol-upgrade
-// bytes are lost, including when the first WebSocket frame arrives with headers.
-fun z_read_headers(fd: int) <&ZBuf> {
+fun z_read_headers(fd: HttpSocket) <&ZBuf> {
     let b <&ZBuf> = z_buf_new();
     let chunk <[char]> = new [char, 4096]{};
     let matched <int> = 0;
@@ -607,7 +725,7 @@ fun z_read_headers(fd: int) <&ZBuf> {
         let cap <int> = z_max_headers() - b.len;
         if (cap > 4096) { cap = 4096; }
         if (cap == 0) { delete chunk; z_buf_free(b); return null; }
-        let got <int> = z_recv_retry(fd, chunk, cap, 2); // MSG_PEEK
+        let got <int> = z_recv_retry(fd, chunk, cap, z_peek_flag());
         if (got <= 0) { delete chunk; z_buf_free(b); return null; }
         let take <int> = got;
         for (let i <int> = 0; i < got; i++) {
@@ -635,8 +753,7 @@ fun z_read_headers(fd: int) <&ZBuf> {
     return b;
 }
 
-// Reads exactly `want` more bytes; callers enforce the appropriate size limit.
-fun z_read_exact(fd: int, b: &ZBuf, want: int) <bool> {
+fun z_read_exact(fd: HttpSocket, b: &ZBuf, want: int) <bool> {
     let need <int> = want;
     let chunk <[char]> = new [char, 8192]{};
     while (need > 0) {
@@ -650,6 +767,109 @@ fun z_read_exact(fd: int, b: &ZBuf, want: int) <bool> {
     delete chunk;
     return true;
 }
+
+// --- shared raw socket surface ---
+//
+// Binary-safe read and write on a socket handle, for protocols layered on
+// this transport (WebSocket frames carry NUL bytes and arbitrary binary
+// payloads, so a `string`-typed send would truncate them at the first NUL).
+//
+// These take the same `HttpSocket` handle as the rest of this module, so a
+// caller never has to redeclare `send`/`recv` with a signature that might
+// disagree with this module's ABI -- the mismatch that broke the WebSocket
+// build when the two modules declared the same symbol differently.
+//
+// Ownership: the buffers belong to the caller. `http_socket_read` writes at
+// most `want` bytes into the caller's array; `http_socket_read_exact`
+// returns a fresh buffer the caller frees with `delete`.
+
+#[export]
+pub struct SocketBytes {
+    pub:
+        ok <bool>,
+        data <[char]>,
+        len <int>,
+}
+
+// Reads up to `want` bytes into `buf`. Returns the count read, 0 at end of
+// stream, or -1 on error. EINTR is retried inside.
+#[export]
+pub fun http_socket_read(fd: HttpSocket, buf: [char], want: int) <int> {
+    if (want <= 0) { return 0; }
+    if (buf.length < want) { return -1; }
+    return z_recv_retry(fd, buf, want, 0);
+}
+
+// Reads up to `want` bytes into `buf` starting at `offset`. Returns the count
+// read, 0 at end of stream, or -1 on error.
+//
+// The offset is part of the contract: a caller that has already filled part
+// of its buffer (a header parser, say) reads the next chunk into the space
+// after what it has, not over the top of it.
+#[export]
+pub fun http_socket_read_at(fd: HttpSocket, buf: [char], offset: int, want: int) <int> {
+    if (want <= 0) { return 0; }
+    if (offset < 0 || buf.length < offset + want) { return -1; }
+    let chunk <[char]> = new [char, want]{};
+    let got <int> = z_recv_retry(fd, chunk, want, 0);
+    if (got > 0) {
+        for (let i <int> = 0; i < got; i++) { buf[offset + i] = chunk[i]; }
+    }
+    delete chunk;
+    return got;
+}
+
+// Peeks up to `want` bytes into `buf` starting at `offset` without consuming
+// them, so the caller can look at the bytes before deciding how many to take.
+#[export]
+pub fun http_socket_peek_at(fd: HttpSocket, buf: [char], offset: int, want: int) <int> {
+    if (want <= 0) { return 0; }
+    if (offset < 0 || buf.length < offset + want) { return -1; }
+    let chunk <[char]> = new [char, want]{};
+    let got <int> = z_recv_retry(fd, chunk, want, z_peek_flag());
+    if (got > 0) {
+        for (let i <int> = 0; i < got; i++) { buf[offset + i] = chunk[i]; }
+    }
+    delete chunk;
+    return got;
+}
+
+// Reads up to `want` bytes into `buf` without consuming them, so the caller
+// can look at the bytes before deciding how many to take. Returns the count
+// read, 0 at end of stream, or -1 on error.
+#[export]
+pub fun http_socket_peek(fd: HttpSocket, buf: [char], want: int) <int> {
+    if (want <= 0) { return 0; }
+    if (buf.length < want) { return -1; }
+    return z_recv_retry(fd, buf, want, z_peek_flag());
+}
+
+// Sends exactly `len` bytes from `buf`. False on error; short writes are
+// retried.
+#[export]
+pub fun http_socket_write(fd: HttpSocket, buf: [char], len: int) <bool> {
+    if (len <= 0) { return true; }
+    if (buf.length < len) { return false; }
+    return z_send_all(fd, buf, len);
+}
+
+// Reads exactly `want` bytes into a fresh buffer. `ok` is false on error and
+// the data is then empty; on success the caller frees `data` with `delete`.
+#[export]
+pub fun http_socket_read_exact(fd: HttpSocket, want: int) <SocketBytes> {
+    let empty <[char]>;
+    if (want <= 0 || want > 16777216) { return SocketBytes{ok: false, data: empty, len: 0}; }
+    let out <[char]> = new [char, want]{};
+    let filled <int> = 0;
+    while (filled < want) {
+        let got <int> = z_recv_retry(fd, out, want - filled, 0);
+        if (got <= 0) { delete out; return SocketBytes{ok: false, data: empty, len: 0}; }
+        filled = filled + got;
+    }
+    return SocketBytes{ok: true, data: out, len: want};
+}
+
+
 
 // ---------------------------------------------------------------------------
 // Internal: message parsing
@@ -739,7 +959,7 @@ fun z_body_length(hdrs: &HttpHeaders, request: bool) <int> {
 }
 
 // Read one CRLF-terminated line without consuming following bytes.
-fun z_read_line(fd: int, b: &ZBuf, limit: int) <bool> {
+fun z_read_line(fd: HttpSocket, b: &ZBuf, limit: int) <bool> {
     let chunk <[char]> = new [char, 4096]{};
     let cr <bool> = false;
     let done <bool> = false;
@@ -747,7 +967,7 @@ fun z_read_line(fd: int, b: &ZBuf, limit: int) <bool> {
         let cap <int> = limit - b.len;
         if (cap > 4096) { cap = 4096; }
         if (cap <= 0) { delete chunk; return false; }
-        let got <int> = z_recv_retry(fd, chunk, cap, 2);
+        let got <int> = z_recv_retry(fd, chunk, cap, z_peek_flag());
         if (got <= 0) { delete chunk; return false; }
         let take <int> = got;
         for (let i <int> = 0; i < got; i++) {
@@ -823,7 +1043,7 @@ fun z_chunk_size(line: &ZBuf) <int> {
 }
 
 // Completion requires the zero chunk AND a valid terminated trailer section.
-fun z_read_chunked(fd: int) <&ZBuf> {
+fun z_read_chunked(fd: HttpSocket) <&ZBuf> {
     let body <&ZBuf> = z_buf_new();
     let line <&ZBuf> = z_buf_new();
     let trailers <&HttpHeaders> = http_new_headers();
@@ -873,7 +1093,7 @@ fun z_first_line(raw: &ZBuf) <int> {
 
 // Read one framed response. Skip bounded informational responses; this GET/POST
 // client does not support 101 (the raw server API supports upgrades).
-fun z_read_response(fd: int) <HttpResult> {
+fun z_read_response(fd: HttpSocket) <HttpResult> {
     let interim <int> = 0;
     while (true) {
         let raw <&ZBuf> = z_read_headers(fd);
@@ -943,8 +1163,8 @@ fun z_http_do(method: string, url: string, content_type: string, body: string, h
         free_str(parsed.err);
         return r;
     }
-    let fd <int> = z_dial(parsed.url.host, parsed.url.port);
-    if (fd < 0) {
+    let fd <HttpSocket> = http_socket_dial(parsed.url.host, parsed.url.port);
+    if (fd == http_socket_invalid()) {
         let msg <string> = z_calloc(cast<ulong>(128), cast<ulong>(1));
         z_snprintf(msg, cast<ulong>(128), "cannot connect to %s:%d", parsed.url.host, parsed.url.port);
         let r2 <HttpResult> = z_http_err(msg);
@@ -985,12 +1205,12 @@ fun z_http_do(method: string, url: string, content_type: string, body: string, h
     http_free_url_result(&parsed);
     if (!z_send_all(fd, req.data, req.len)) {
         z_buf_free(req);
-        z_close(fd);
+        http_socket_close(fd);
         return z_http_err("send failed");
     }
     z_buf_free(req);
     let result <HttpResult> = z_read_response(fd);
-    z_close(fd);
+    http_socket_close(fd);
     return result;
 }
 
@@ -1012,19 +1232,27 @@ pub fun http_post(url: string, content_type: string, body: string) <HttpResult> 
 pub fun http_listen(port: int) <&HttpServer> {
     blame port >= 0, "http_listen: port cannot be negative";
     blame port <= 65535, "http_listen: port out of range";
-    let addr <[int]> = z_sockaddr("0.0.0.0", port);
-    let fd <int> = z_socket(2, 1, 0);
-    blame fd >= 0, "http_listen: cannot open socket";
-    let bound <int> = z_bind(fd, &addr[0], 16);
-    if (bound != 0) {
-        z_close(fd);
+    let addr <[int]> = http_sockaddr("0.0.0.0", port);
+    blame z_acquire(), "http_listen: cannot initialize Winsock";
+    let fd <HttpSocket> = z_socket(2, 1, 0);
+    if (fd == http_socket_invalid() || !z_no_sigpipe(fd)) {
         delete addr;
+        if (fd != http_socket_invalid()) { z_native_close(fd); }
+        z_release();
+        blame false, "http_listen: cannot open socket";
+    }
+    let bound <int> = z_bind(fd, &addr[0], cast<ZAddrLen>(16));
+    if (bound != 0) {
+        z_native_close(fd);
+        delete addr;
+        z_release();
         blame bound == 0, "http_listen: cannot bind (port in use?)";
     }
     let err <int> = z_listen(fd, 16);
     if (err != 0) {
-        z_close(fd);
+        z_native_close(fd);
         delete addr;
+        z_release();
         blame err == 0, "http_listen: cannot listen";
     }
     delete addr;
@@ -1035,7 +1263,7 @@ pub fun http_listen(port: int) <&HttpServer> {
 #[export]
 pub fun http_server_port(srv: &HttpServer) <int> {
     let got <[int]> = new [int, 4]{};
-    let glen <int> = 16;
+    let glen <ZAddrLen> = cast<ZAddrLen>(16);
     let r <int> = z_getsockname(srv.fd, &got[0], &glen);
     blame r == 0, "http_server_port: cannot read local address";
     let u <uint> = cast<uint>(got[0]);
@@ -1048,14 +1276,18 @@ pub fun http_server_port(srv: &HttpServer) <int> {
 #[export]
 pub fun http_accept(srv: &HttpServer) <&HttpConn> {
     let peer <[int]> = new [int, 4]{};
-    let peerlen <int> = 16;
-    let fd <int> = z_accept(srv.fd, &peer[0], &peerlen);
-    while (fd < 0 && *z_errno() == 4) {
-        peerlen = 16;
+    let peerlen <ZAddrLen> = cast<ZAddrLen>(16);
+    let fd <HttpSocket> = z_accept(srv.fd, &peer[0], &peerlen);
+    while (fd == http_socket_invalid() && z_interrupted()) {
+        peerlen = cast<ZAddrLen>(16);
         fd = z_accept(srv.fd, &peer[0], &peerlen);
     }
     delete peer;
-    blame fd >= 0, "http_accept: cannot accept connection";
+    blame fd != http_socket_invalid(), "http_accept: cannot accept connection";
+    if (!z_acquire() || !z_no_sigpipe(fd)) {
+        z_native_close(fd);
+        blame false, "http_accept: cannot prepare the accepted socket";
+    }
     return new HttpConn{fd: fd};
 }
 
@@ -1174,12 +1406,14 @@ pub fun http_write_raw(conn: &HttpConn, text: string) <bool> {
     return z_send_str(conn.fd, text);
 }
 
-// Transfer fd ownership to the caller, freeing only the connection wrapper.
-// The caller must eventually close the returned fd; conn is invalid afterwards.
+// Transfer handle ownership to the caller, freeing only the connection wrapper.
+// The caller must eventually close the returned handle; conn is invalid
+// afterwards. On Windows the transferred socket carries its one Winsock
+// startup reference, released by http_socket_close.
 #[export]
-pub fun http_detach(conn: &HttpConn) <int> {
-    if (conn == null) { return -1; }
-    let fd <int> = conn.fd;
+pub fun http_detach(conn: &HttpConn) <HttpSocket> {
+    if (conn == null) { return http_socket_invalid(); }
+    let fd <HttpSocket> = conn.fd;
     delete conn;
     return fd;
 }
@@ -1187,14 +1421,14 @@ pub fun http_detach(conn: &HttpConn) <int> {
 #[export]
 pub fun http_close(conn: &HttpConn) <noret> {
     if (conn == null) { return; }
-    z_close(conn.fd);
+    http_socket_close(conn.fd);
     delete conn;
 }
 
 #[export]
 pub fun http_server_close(srv: &HttpServer) <noret> {
     if (srv == null) { return; }
-    z_close(srv.fd);
+    http_socket_close(srv.fd);
     delete srv;
 }
 

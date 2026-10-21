@@ -163,11 +163,17 @@ use `http_header_has` to distinguish missing from empty.
 - **IPv4 dotted-quad hosts only** — no DNS resolution (`http://127.0.0.1:8080/`
   works; `http://localhost/` does not). Same limitation as `networking::std`.
 - **No TLS** — `https://` URLs are rejected with an explicit error.
-- **Linux/POSIX transport** — socket ABI, `MSG_PEEK`, `MSG_NOSIGNAL`, and
-  `__errno_location` currently target 64-bit Linux. Other platforms need bindings.
-  `send`/`recv` use `ulong` lengths and `long` results; do not mix these with
-  legacy `networking::std` int-sized declarations of the same linker symbols.
-  Consumers such as fin-websocket need the coordinated updated bindings.
+- **Native transport for Linux, macOS and Windows** — the socket ABI, the
+  error source and the buffer types are selected from the compiler's native
+  target (ADR 0051 addendum): `SOCKET` is a pointer width on Windows and an
+  `int` elsewhere, `send`/`recv` take an `int` length on Windows and a
+  `size_t` one elsewhere, and a failure is read from `WSAGetLastError` or from
+  `errno` as the target requires. `MSG_NOSIGNAL` is used on Linux only; macOS
+  sets `SO_NOSIGPIPE` on the socket instead, and Windows has neither, so a
+  write to a closed peer is reported as an error rather than a signal.
+  The declarations live here and nowhere else, so a consumer cannot declare
+  the same linker symbols with a signature that disagrees: `fin-websocket`
+  uses this module's exported raw read and write.
 - **Blocking I/O without deadlines** — framed responses return at message
   completion, not EOF, but incomplete messages and close-delimited responses can
   still wait indefinitely. Applications must provide deadlines/concurrency.
@@ -186,9 +192,9 @@ use `http_header_has` to distinguish missing from empty.
 ## Dependencies
 
 - Fin standard library only (`collection::std`, `strings::std`, `testing::std`
-  for tests). Local libc socket bindings are vendored because only `#[global]`
-  externs lower through module imports. Unlike legacy `networking::std`, the
-  send/recv declarations here use the correct 64-bit Linux ABI.
+  for tests). The socket bindings are vendored here because only `#[global]`
+  externs lower through module imports, and they are selected for the native
+  target rather than fixed to one platform's ABI.
 
 ## Development
 

@@ -1,6 +1,8 @@
 """Adversarial public-API tests. Run with an already-built tests/test_lib.fin binary.
 
-Linux/POSIX only, like zhttp's transport. No fixed ports, external services, or sleeps.
+Runs on every platform zhttp supports: the peer is a loopback socket and the
+driver under test dials it, so nothing depends on a descriptor surviving
+exec -- which is a POSIX-only mechanism. No fixed ports, external services, or sleeps.
 """
 import os
 import socket
@@ -15,16 +17,30 @@ MAX_HEADERS = 64 * 1024
 COUNT = 0
 
 
-def launch(mode, fd=None, url=None):
+def launch(mode, port=None, url=None):
     env = dict(os.environ, ZHTTP_TEST_MODE=mode)
-    if fd is not None:
-        env["ZHTTP_TEST_FD"] = str(fd)
+    if port is not None:
+        env["ZHTTP_TEST_PORT"] = str(port)
     if url is not None:
         env["ZHTTP_TEST_URL"] = url
     return subprocess.Popen(
-        [BINARY], env=env, pass_fds=() if fd is None else (fd,),
+        [BINARY], env=env,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
+
+
+def peer_for(ours):
+    """The peer end of a connected loopback pair.
+
+    The driver dials the listener itself, so the peer is a plain accepted
+    socket on the loopback address rather than a descriptor handed over
+    across exec.
+    """
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(8)
+    return listener
 
 
 def check(process, expected, label):
@@ -53,12 +69,13 @@ def send(peer, payload):
 
 
 def request(label, payload, expected="REJECT", eof=False, upgrade=False):
-    ours, peer = socket.socketpair()
-    with ours, peer:
-        p = launch("upgrade" if upgrade else "request", fd=ours.fileno())
-        ours.close()
-        peer.settimeout(8)
+    with peer_for(None) as listener:
+        port = listener.getsockname()[1]
+        p = launch("upgrade" if upgrade else "request", port=port)
+        peer = None
         try:
+            peer, _ = listener.accept()
+            peer.settimeout(8)
             send(peer, payload)
             if eof:
                 try:
@@ -67,6 +84,8 @@ def request(label, payload, expected="REJECT", eof=False, upgrade=False):
                     pass
             check(p, expected, label)
         finally:
+            if peer is not None:
+                peer.close()
             if p.poll() is None:
                 p.kill()
                 p.communicate()
@@ -198,38 +217,64 @@ for name, body in [
     ("metadata limit", b"1\r\na\r\n" * 14000 + b"0\r\n\r\n"),
 ]:
     response("chunk " + name, CHUNK + body, eof=True)
-ours, peer = socket.socketpair()
-with ours, peer:
-    p = launch("response", fd=ours.fileno())
-    ours.close()
-    peer.settimeout(8)
-    wire = b""
-    while True:
-        part = peer.recv(4096)
-        if not part:
-            break
-        wire += part
-    assert b"Content-Length:" not in wire and wire.endswith(b"\r\n\r\n"), wire
-    assert b"must not be sent" not in wire, wire
-    check(p, "SENT", "204 writer emits no body or forbidden length")
-# Python resets SIGPIPE to default before exec; MSG_NOSIGNAL must suppress it.
-ours, peer = socket.socketpair()
-peer.close()
-with ours:
-    p = launch("write", fd=ours.fileno())
-    ours.close()
-    check(p, "SEND_FAILED", "closed peer does not deliver SIGPIPE")
-with socket.socket() as listener:
-    listener.bind(("127.0.0.1", 0))
-    listener.listen(1)
-    peer = socket.create_connection(listener.getsockname())
-    ours, _ = listener.accept()
-    peer.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-    peer.close()
-    with ours:
-        p = launch("write", fd=ours.fileno())
-        ours.close()
-        check(p, "SEND_FAILED", "TCP peer reset is recoverable")
+with peer_for(None) as listener:
+    port = listener.getsockname()[1]
+    p = launch("response", port=port)
+    peer = None
+    try:
+        peer, _ = listener.accept()
+        peer.settimeout(8)
+        wire = b""
+        while True:
+            part = peer.recv(4096)
+            if not part:
+                break
+            wire += part
+        assert b"Content-Length:" not in wire and wire.endswith(b"\r\n\r\n"), wire
+        assert b"must not be sent" not in wire, wire
+        check(p, "SENT", "204 writer emits no body or forbidden length")
+    finally:
+        if peer is not None:
+            peer.close()
+        if p.poll() is None:
+            p.kill()
+            p.communicate()
+# The peer closes before the driver writes, so the write must fail rather than
+# raise a signal. Linux suppresses the signal with MSG_NOSIGNAL, macOS with
+# SO_NOSIGPIPE on the socket, and Windows reports the error.
+with peer_for(None) as listener:
+    port = listener.getsockname()[1]
+    p = launch("write", port=port)
+    peer = None
+    try:
+        peer, _ = listener.accept()
+        peer.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        peer.close()
+        peer = None
+        check(p, "SEND_FAILED", "closed peer does not deliver SIGPIPE")
+    finally:
+        if peer is not None:
+            peer.close()
+        if p.poll() is None:
+            p.kill()
+            p.communicate()
+# A peer that closes gracefully leaves the connection half-open: the driver
+# reads end of stream, and the write that follows is legal and must succeed.
+# This is a different case from the reset above, which must fail.
+with peer_for(None) as listener:
+    port = listener.getsockname()[1]
+    p = launch("write", port=port)
+    peer = None
+    try:
+        peer, _ = listener.accept()
+        peer.shutdown(socket.SHUT_WR)
+        check(p, "SENT", "graceful peer close still allows a write")
+    finally:
+        if peer is not None:
+            peer.close()
+        if p.poll() is None:
+            p.kill()
+            p.communicate()
 # Fault injection is isolated to this subprocess; no process-global handlers.
 # Each syscall gets EINTR once, then short send/recv counts exercise retry loops.
 SHIM = r'''

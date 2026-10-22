@@ -13,7 +13,8 @@ import {
     http_socket_dial, http_socket_close, http_socket_invalid, http_socket_read, HttpSocket
 } from zhttp::fin;
 import { assert_true, assert_eq_int, assert_eq_string } from testing::std;
-import { free_str, equals, len } from strings::std;
+import { free_str, equals, len, clone } from strings::std;
+import { Thread } from sync::std;
 
 #[llvm_name="getenv"]
 @define t_getenv(name: string) <string>;
@@ -80,17 +81,40 @@ fun protocol_driver(mode: string) <noret> {
 #[llvm_name="free"]
 @define t_cfree(p: string) <noret>;
 
-#[llvm_name="fork"]
-@define t_fork() <int>;
+// What the worker thread reports back to the main thread. A pointer to this
+// is captured, so the two sides see the same memory.
+struct Loopback {
+    port <int>,
+    ok <bool>,
+    status <int>,
+    body <string>,
+    header_count <int>,
+}
 
-#[llvm_name="usleep"]
-@define t_usleep(usec: int) <int>;
+// Runs the client request on a worker thread while the main thread serves.
+fun client_get(shared: &Loopback, path: string) <noret> {
+    let url <string> = t_calloc(cast<ulong>(256), cast<ulong>(1));
+    t_snprintf(url, cast<ulong>(256), "http://127.0.0.1:%d%s", shared.port, path);
+    let r <HttpResult> = http_get(url);
+    t_cfree(url);
+    shared.ok = r.ok;
+    shared.status = r.status;
+    shared.body = clone(r.body);
+    shared.header_count = http_header_count(r.headers);
+    http_free_result(&r);
+}
 
-#[llvm_name="_exit"]
-@define t_exit(code: int) <noret>;
-
-#[llvm_name="waitpid"]
-@define t_waitpid(pid: int, status: &int, opts: int) <int>;
+fun client_post(shared: &Loopback, path: string, content_type: string, body: string) <noret> {
+    let url <string> = t_calloc(cast<ulong>(256), cast<ulong>(1));
+    t_snprintf(url, cast<ulong>(256), "http://127.0.0.1:%d%s", shared.port, path);
+    let r <HttpResult> = http_post(url, content_type, body);
+    t_cfree(url);
+    shared.ok = r.ok;
+    shared.status = r.status;
+    shared.body = clone(r.body);
+    shared.header_count = http_header_count(r.headers);
+    http_free_result(&r);
+}
 
 fun test_url_parsing() <noret> {
     let r <HttpUrlResult> = http_parse_url("http://127.0.0.1:8080/path?q=1");
@@ -182,42 +206,37 @@ fun test_loopback_get() <noret> {
     let port <int> = http_server_port(srv);
     assert_true(port > 0, "loopback: ephemeral port assigned");
 
-    let pid <int> = t_fork();
-    blame pid >= 0, "loopback: fork failed";
-    if (pid == 0) {
-        let conn <&HttpConn> = http_accept(srv);
-        let rr <HttpReadResult> = http_read_request(conn);
-        if (rr.ok) {
-            let ok_method <bool> = equals(rr.req.method, "GET");
-            let ok_target <bool> = equals(rr.req.target, "/hello?name=fin");
-            let resp <&HttpResponse> = null;
-            if (ok_method && ok_target) {
-                resp = http_response(200, "hello, fin!");
-            } else {
-                resp = http_response(400, "bad request");
-            }
-            http_write_response(conn, resp);
-            http_free_response(resp);
-            http_free_read_result(&rr);
+    let shared <&Loopback> = new Loopback{port: port, ok: false, status: 0, body: "", header_count: 0};
+    let worker <Thread> = Thread::spawn(fun () <noret> {
+        client_get(shared, "/hello?name=fin");
+    });
+
+    let conn <&HttpConn> = http_accept(srv);
+    let rr <HttpReadResult> = http_read_request(conn);
+    if (rr.ok) {
+        let ok_method <bool> = equals(rr.req.method, "GET");
+        let ok_target <bool> = equals(rr.req.target, "/hello?name=fin");
+        let resp <&HttpResponse> = null;
+        if (ok_method && ok_target) {
+            resp = http_response(200, "hello, fin!");
         } else {
-            http_free_read_result(&rr);
+            resp = http_response(400, "bad request");
         }
-        http_close(conn);
-        http_server_close(srv);
-        t_exit(0);
+        http_write_response(conn, resp);
+        http_free_response(resp);
+        http_free_read_result(&rr);
+    } else {
+        http_free_read_result(&rr);
     }
-    t_usleep(400000);
-    let url <string> = t_calloc(cast<ulong>(256), cast<ulong>(1));
-    t_snprintf(url, cast<ulong>(256), "http://127.0.0.1:%d/hello?name=fin", port);
-    let r <HttpResult> = http_get(url);
-    t_cfree(url);
-    assert_true(r.ok, "loopback GET: ok");
-    assert_eq_int(r.status, 200, "loopback GET: status 200");
-    assert_eq_string(r.body, "hello, fin!", "loopback GET: body");
-    assert_true(http_header_count(r.headers) > 0, "loopback GET: headers present");
-    http_free_result(&r);
-    let status <int> = 0;
-    t_waitpid(pid, &status, 0);
+    http_close(conn);
+    worker.join();
+
+    assert_true(shared.ok, "loopback GET: ok");
+    assert_eq_int(shared.status, 200, "loopback GET: status 200");
+    assert_eq_string(shared.body, "hello, fin!", "loopback GET: body");
+    assert_true(shared.header_count > 0, "loopback GET: headers present");
+    free_str(shared.body);
+    delete shared;
     http_server_close(srv);
     printf("loopback GET: ok\n");
 }
@@ -226,55 +245,49 @@ fun test_loopback_post_and_chunked() <noret> {
     let srv <&HttpServer> = http_listen(0);
     let port <int> = http_server_port(srv);
 
-    let pid <int> = t_fork();
-    blame pid >= 0, "loopback: fork failed";
-    if (pid == 0) {
-        // serve two connections: one POST echo, one chunked GET
-        for (let c <int> = 0; c < 2; c++) {
-            let conn <&HttpConn> = http_accept(srv);
-            let rr <HttpReadResult> = http_read_request(conn);
-            if (rr.ok) {
-                if (equals(rr.req.target, "/echo")) {
-                    let resp <&HttpResponse> = http_response_with_type(200, "application/json", rr.req.body);
-                    http_write_response(conn, resp);
-                    http_free_response(resp);
-                } else {
-                    // raw chunked response: "Hello, " + "chunked!"
-                    http_write_raw(conn, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n7\r\nHello, \r\n8\r\nchunked!\r\n0\r\n\r\n");
-                }
-                http_free_read_result(&rr);
+    // Two requests, two connections: one POST echo and one chunked GET.
+    // The client side runs on a worker thread and the server side on the main
+    // thread, so the test needs no second process.
+    let post_shared <&Loopback> = new Loopback{port: port, ok: false, status: 0, body: "", header_count: 0};
+    let chunk_shared <&Loopback> = new Loopback{port: port, ok: false, status: 0, body: "", header_count: 0};
+    let post_worker <Thread> = Thread::spawn(fun () <noret> {
+        client_post(post_shared, "/echo", "application/json", "{\"ping\": true}");
+    });
+    let chunk_worker <Thread> = Thread::spawn(fun () <noret> {
+        client_get(chunk_shared, "/chunked");
+    });
+
+    for (let c <int> = 0; c < 2; c++) {
+        let conn <&HttpConn> = http_accept(srv);
+        let rr <HttpReadResult> = http_read_request(conn);
+        if (rr.ok) {
+            if (equals(rr.req.target, "/echo")) {
+                let resp <&HttpResponse> = http_response_with_type(200, "application/json", rr.req.body);
+                http_write_response(conn, resp);
+                http_free_response(resp);
             } else {
-                http_free_read_result(&rr);
+                // raw chunked response: "Hello, " + "chunked!"
+                http_write_raw(conn, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n7\r\nHello, \r\n8\r\nchunked!\r\n0\r\n\r\n");
             }
-            http_close(conn);
+            http_free_read_result(&rr);
+        } else {
+            http_free_read_result(&rr);
         }
-        http_server_close(srv);
-        t_exit(0);
+        http_close(conn);
     }
-    t_usleep(400000);
+    post_worker.join();
+    chunk_worker.join();
 
-    // POST with JSON body
-    let url <string> = t_calloc(cast<ulong>(256), cast<ulong>(1));
-    t_snprintf(url, cast<ulong>(256), "http://127.0.0.1:%d/echo", port);
-    let r <HttpResult> = http_post(url, "application/json", "{\"ping\": true}");
-    t_cfree(url);
-    assert_true(r.ok, "loopback POST: ok");
-    assert_eq_int(r.status, 200, "loopback POST: status 200");
-    assert_eq_string(r.body, "{\"ping\": true}", "loopback POST: echo body");
-    http_free_result(&r);
-
-    // GET with chunked response
-    let url2 <string> = t_calloc(cast<ulong>(256), cast<ulong>(1));
-    t_snprintf(url2, cast<ulong>(256), "http://127.0.0.1:%d/chunked", port);
-    let r2 <HttpResult> = http_get(url2);
-    t_cfree(url2);
-    assert_true(r2.ok, "loopback chunked: ok");
-    assert_eq_int(r2.status, 200, "loopback chunked: status 200");
-    assert_eq_string(r2.body, "Hello, chunked!", "loopback chunked: de-chunked body");
-    http_free_result(&r2);
-
-    let status <int> = 0;
-    t_waitpid(pid, &status, 0);
+    assert_true(post_shared.ok, "loopback POST: ok");
+    assert_eq_int(post_shared.status, 200, "loopback POST: status 200");
+    assert_eq_string(post_shared.body, "{\"ping\": true}", "loopback POST: echo body");
+    assert_true(chunk_shared.ok, "loopback chunked: ok");
+    assert_eq_int(chunk_shared.status, 200, "loopback chunked: status 200");
+    assert_eq_string(chunk_shared.body, "Hello, chunked!", "loopback chunked: de-chunked body");
+    free_str(post_shared.body);
+    free_str(chunk_shared.body);
+    delete post_shared;
+    delete chunk_shared;
     http_server_close(srv);
     printf("loopback POST + chunked: ok\n");
 }

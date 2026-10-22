@@ -813,13 +813,15 @@ pub fun http_socket_read(fd: HttpSocket, buf: [char], want: int) <int> {
 pub fun http_socket_read_at(fd: HttpSocket, buf: [char], offset: int, want: int) <int> {
     if (want <= 0) { return 0; }
     if (offset < 0 || buf.length < offset + want) { return -1; }
-    let chunk <[char]> = new [char, want]{};
-    let got <int> = z_recv_retry(fd, chunk, want, 0);
-    if (got > 0) {
-        for (let i <int> = 0; i < got; i++) { buf[offset + i] = chunk[i]; }
+    // Read straight into the caller's buffer. A scratch buffer the size of
+    // the request would be allocated per read, and a caller reading a
+    // 16 MiB frame in socket-sized pieces would allocate 16 MiB every time.
+    let got <ZCount> = z_recv(fd, &buf[offset], cast<ZSize>(want), 0);
+    if (got < cast<ZCount>(0)) {
+        if (z_interrupted()) { return http_socket_read_at(fd, buf, offset, want); }
+        return -1;
     }
-    delete chunk;
-    return got;
+    return cast<int>(got);
 }
 
 // Peeks up to `want` bytes into `buf` starting at `offset` without consuming
@@ -854,6 +856,26 @@ pub fun http_socket_write(fd: HttpSocket, buf: [char], len: int) <bool> {
     if (len <= 0) { return true; }
     if (buf.length < len) { return false; }
     return z_send_all(fd, buf, len);
+}
+
+// Sends exactly `len` bytes starting at `offset`. The offset is part of the
+// contract: a caller writing a large buffer in pieces has to say where each
+// piece starts, or every piece sends the same bytes.
+#[export]
+pub fun http_socket_write_at(fd: HttpSocket, buf: [char], offset: int, len: int) <bool> {
+    if (len <= 0) { return true; }
+    if (offset < 0 || buf.length < offset + len) { return false; }
+    let sent <int> = 0;
+    while (sent < len) {
+        let got <ZCount> = z_send(fd, &buf[offset + sent], cast<ZSize>(len - sent), z_send_flags());
+        if (got < cast<ZCount>(0)) {
+            if (z_interrupted()) { continue; }
+            return false;
+        }
+        if (got == cast<ZCount>(0)) { return false; }
+        sent = sent + cast<int>(got);
+    }
+    return true;
 }
 
 // Reads exactly `want` bytes into a fresh buffer. `ok` is false on error and

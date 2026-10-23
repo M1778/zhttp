@@ -105,25 +105,28 @@ fun z_interrupted() <bool> {
     #c_endif
 }
 
-// SIGPIPE policy, selected per target and never silently dropped:
-//   Linux  - MSG_NOSIGNAL in z_send_flags().
-//   macOS  - SO_NOSIGPIPE on the descriptor: Darwin has no MSG_NOSIGNAL.
-//   Windows- not applicable; send() reports WSAECONNRESET/WSAECONNABORTED.
-// A failed setsockopt is reported by http_* calls that create sockets, not
-// ignored: a Darwin caller must not risk process termination on a reset peer.
+// SIGPIPE protection does not change process-wide signal handlers.
+// Darwin needs a full int option value; setsockopt reads all four bytes.
 fun z_no_sigpipe(fd: HttpSocket) <bool> {
     #c_ifdef FIN_TARGET_DARWIN
-    let one <char> = cast<char>(1);
-    let status <int> = z_setsockopt(fd, 65535, 4130, &one, cast<uint>(4)); // SO_NOSIGPIPE
+    let one <[char]> = new [char, 4]{};
+    one[0] = cast<char>(1);
+    let status <int> = z_setsockopt(fd, 65535, 4130, &one[0], cast<uint>(4));
+    delete one;
     return status == 0;
     #c_else
     return true;
     #c_endif
 }
-#c_ifdef FIN_TARGET_LINUX
-fun z_send_flags() <int> { return 16384; } // MSG_NOSIGNAL; leave handlers alone.
-#c_else
+#c_ifdef FIN_TARGET_WINDOWS
 fun z_send_flags() <int> { return 0; }
+#c_else
+#c_ifdef FIN_TARGET_DARWIN
+fun z_send_flags() <int> { return 0; }
+#c_else
+// Older Linux compilers lack target selectors but still need MSG_NOSIGNAL.
+fun z_send_flags() <int> { return 16384; }
+#c_endif
 #c_endif
 #[export]
 pub fun http_socket_invalid() <HttpSocket> { return cast<HttpSocket>(-1); }

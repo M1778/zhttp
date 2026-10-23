@@ -3,9 +3,13 @@
 HTTP/1.1 client and server for [Fin](https://github.com/M1778/Fin). Built on raw
 blocking TCP over IPv4 (the same design as `networking::std`).
 
-> **Verification status:** ✅ VERIFIED — built with `finc 0.4.0` (contract 3);
-> full test suite passes, including real loopback client/server tests (GET, POST
-> echo, chunked decoding). CI also builds finc from source and re-runs everything.
+> **Native verification:** O0/O2 client/server and protocol suites passed on
+> Linux, macOS and Windows, each on x86_64 and ARM64, in
+> [ecosystem run 40034937084](https://github.com/M1778/fin-sdk/actions/runs/40034937084)
+> at zhttp revision `5f6746da3a2294804c42534ba44a066c6b6705c8`.
+> Tests include loopback GET/POST, chunked decoding and malformed framed peers.
+> The exact compiler candidate is `5360b051b8e82a4f10052c3dbb77bc66cc727cd7`
+> from successful CI run `40028977601`, not a released toolchain.
 
 ## Install
 

@@ -52,7 +52,11 @@ def check(process, expected, label):
         process.communicate()
         raise AssertionError(f"{label}: blocked after complete framed message")
     assert process.returncode == 0, (label, process.returncode, err.decode())
-    assert out.decode().strip() == expected, (label, out.decode(), expected)
+    output = out.decode("utf-8")
+    # Only driver console lines are normalized; wire payload checks stay byte-exact.
+    if os.name == "nt":
+        output = output.replace("\r\n", "\n")
+    assert output.strip() == expected, (label, output, expected)
     COUNT += 1
     print(f"PASS {label}")
 

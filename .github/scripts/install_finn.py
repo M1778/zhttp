@@ -40,6 +40,7 @@ refuses instead of installing unverified bytes.
 
 import argparse
 import hashlib
+import os
 import platform
 import shutil
 import subprocess
@@ -121,7 +122,12 @@ def main() -> int:
                 zf.extractall(dest)
         else:
             with tarfile.open(archive) as tf:
-                tf.extractall(dest)
+                # `filter` exists from 3.12; on older interpreters the argument
+                # is absent, so fall back to the plain call.
+                try:
+                    tf.extractall(dest, filter="data")
+                except TypeError:
+                    tf.extractall(dest)
 
     binary = dest / ("finn.exe" if sys.platform == "win32" else "finn")
     if not binary.exists():

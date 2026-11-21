@@ -40,7 +40,7 @@ jobs:
             # those two rather than dropping the case silently.
             shim: "yes"
           - name: macos-arm64
-            os: macos-14
+            os: macos-15
             shim: "no"
           - name: windows-x86_64
             os: windows-2022

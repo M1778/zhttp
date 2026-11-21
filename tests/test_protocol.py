@@ -33,6 +33,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 BINARY = os.path.abspath(sys.argv[1])
 MAX_BODY = 16 * 1024 * 1024
@@ -80,6 +81,12 @@ def check(process, expected, label):
     print(f"PASS {label}")
 
 
+def launch_url(mode, listener, path):
+    """Start the driver against a listener, returning (process, port)."""
+    port = listener.getsockname()[1]
+    return launch(mode, url=f"http://127.0.0.1:{port}{path}"), port
+
+
 def send(peer, payload):
     try:
         if isinstance(payload, list):
@@ -91,10 +98,10 @@ def send(peer, payload):
         pass  # A parser may reject a prefix before we finish sending.
 
 
-def request(label, payload, expected="REJECT", eof=False, upgrade=False):
+def request(label, payload, expected="REJECT", eof=False, upgrade=False, mode=None):
     with peer_for(None) as listener:
         port = listener.getsockname()[1]
-        p = launch("upgrade" if upgrade else "request", port=port)
+        p = launch(mode or ("upgrade" if upgrade else "request"), port=port)
         peer = None
         try:
             peer, _ = listener.accept()
@@ -298,6 +305,103 @@ with peer_for(None) as listener:
         if p.poll() is None:
             p.kill()
             p.communicate()
+# A request target is written into the request line, so a CR/LF in it would
+# become an injected header. The guard runs before dialling: the driver must
+# refuse, and no connection may appear at the peer.
+for label, path in [
+    ("CRLF in request target", "/a\r\nX-Injected: yes"),
+    ("bare LF in request target", "/a\nb"),
+    ("space in request target", "/a b"),
+]:
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(1)
+    try:
+        p, _ = launch_url("client_inject", listener, path)
+        out, err = p.communicate(timeout=8)
+        assert p.returncode == 0, (label, p.returncode, err.decode())
+        text = out.decode().strip()
+        assert text.startswith("REJECT"), (label, text)
+        assert "refusing" in text, (label, text)
+        try:
+            accepted, _ = listener.accept()
+        except socket.timeout:
+            accepted = None
+        assert accepted is None, f"{label}: the client dialled and wrote to the wire before refusing"
+        if accepted is not None:
+            accepted.close()
+        COUNT += 1
+        print(f"PASS {label} refused before the wire")
+    finally:
+        listener.close()
+        if p.poll() is None:
+            p.kill()
+            p.communicate()
+
+# A peer that opens a connection and then says nothing must not hold the client
+# forever. The deadline is an idle timeout, so a request that keeps arriving
+# would survive; this peer sends a partial header block and stops.
+listener = socket.socket()
+listener.bind(("127.0.0.1", 0))
+listener.listen(1)
+listener.settimeout(8)
+try:
+    p, _ = launch_url("client_timeout", listener, "/")
+    peer, _ = listener.accept()
+    with peer:
+        peer.recv(4096)
+        peer.sendall(b"HTTP/1.1 200 OK\r\nX-Slow: 1")  # no CRLFCRLF, never closed
+        started = time.monotonic()
+        out, err = p.communicate(timeout=8)
+        elapsed = time.monotonic() - started
+    text = out.decode().strip()
+    assert p.returncode == 0, (p.returncode, err.decode())
+    assert text.startswith("REJECT") and "timed out" in text, text
+    # The requested deadline is 250 ms; allow scheduling slack but prove the
+    # call returned rather than blocking until the peer closed.
+    assert elapsed < 5, f"client took {elapsed:.1f}s to honour a 250 ms deadline"
+    COUNT += 1
+    print(f"PASS client deadline fired in {elapsed:.2f}s on a silent peer")
+finally:
+    listener.close()
+    if p.poll() is None:
+        p.kill()
+        p.communicate()
+
+# No keep-alive: a completed request closes the connection. Reading the same
+# connection a second time must be refused by name rather than parsing whatever
+# bytes remain after the first message as if they were a request boundary.
+request("second read on one connection", b"GET / HTTP/1.1\r\n\r\nTAIL",
+        "ACCEPT 0\nSECOND_REJECT: connection already served one request (no keep-alive; open a new connection)",
+        mode="twice")
+
+# http_socket_read_exact must assemble fragmented data, not overwrite its own
+# buffer: the two-part case used to return the tail followed by zeroes.
+listener = socket.socket()
+listener.bind(("127.0.0.1", 0))
+listener.listen(1)
+listener.settimeout(8)
+try:
+    port = listener.getsockname()[1]
+    p = launch("exact", port=port)
+    peer, _ = listener.accept()
+    with peer:
+        time.sleep(0.05)
+        peer.sendall(b"ABCD")
+        time.sleep(0.15)
+        peer.sendall(b"EFGH")
+    out, err = p.communicate(timeout=8)
+    assert p.returncode == 0, (p.returncode, err.decode())
+    assert out.decode().strip() == "ABCDEFGH", out.decode()
+    COUNT += 1
+    print("PASS http_socket_read_exact assembles fragmented reads")
+finally:
+    listener.close()
+    if p.poll() is None:
+        p.kill()
+        p.communicate()
+
 # Fault injection is isolated to this subprocess; no process-global handlers.
 # Each syscall gets EINTR once, then short send/recv counts exercise retry loops.
 #

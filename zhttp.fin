@@ -1,0 +1,38 @@
+// =============================================================================
+// Fin Programming Language
+//
+// Made with ❤️ for someone special.
+//
+// This project is genuinely built on love and dedication, a way to express your love can be done through Fin.
+// Fin is a semi-object-orientated programming language that specialized in control, giving so much control to the user while asking for the bare minimum.
+// Fin is the name of the Angel from BlackNightmare-Stories not yet published.
+// “Love is the reason this project exists”
+// -----------------------------------------------------------------------------
+// Author: M1778
+// Repository: https://github.com/M1778/zhttp
+// Profile: https://github.com/M1778M/
+// -----------------------------------------------------------------------------
+// Copyright (C) 2027 M1778
+//
+// This file is part of zhttp, a project for the Fin Programming Language.
+//
+// Licensed under the MIT License. See LICENSE in the repository root.
+//
+// SPDX-License-Identifier: MIT
+// =============================================================================
+
+// Package entry module: this file is what `import { ... } from zhttp::fin`
+// resolves to.
+//
+// `finn` adds a package's root directory to the module search path, so the
+// module named `zhttp` must be a file `zhttp.fin` beside this manifest. The
+// implementation lives in src/zhttp.fin; this file exists only to publish its
+// `fin` namespace under the package name.
+//
+// The import is pathless (`src.zhttp`), not `"src/zhttp.fin"`. A quoted import
+// is resolved relative to this file at compile time, so it would only work from
+// this checkout; a pathless one is looked up in the search paths of whoever is
+// compiling, which is what makes the package relocatable.
+namespace fin {
+import * from src.zhttp;
+}

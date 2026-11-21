@@ -1,6 +1,21 @@
+# finn.toml — consumed by the real package manager (github.com/M1778/finn).
+#
+# This is a library, not an application. `entrypoint` is the file `finn build`
+# would compile into an executable, and a library has no `main`, so
+# `finn build` fails here by design:
+#
+#     error: this program has no 'main'
+#
+# `finn test` is the command that matters for this repository: it compiles and
+# executes every tests/**/*.fin program, and finn puts src/ on the module search
+# path so `import ... from zhttp::fin` resolves to src/zhttp.fin.
+#
+# The module a *consumer* imports is zhttp.fin at the repository root, because
+# finn adds a copy of a package to the search path by its root directory. That
+# file publishes src/zhttp.fin's `fin` namespace under the package name.
 [project]
 name = "zhttp"
-version = "0.1.0"
+version = "0.2.0"
 envpath = ".finn"
 entrypoint = "zhttp.fin"
 
@@ -8,3 +23,4 @@ entrypoint = "zhttp.fin"
 
 [scripts]
 test = "finc -I src tests/test_lib.fin -o test_zhttp && ./test_zhttp"
+protocol = "finc -I src tests/test_lib.fin -o test_zhttp && python3 -I tests/test_protocol.py ./test_zhttp"

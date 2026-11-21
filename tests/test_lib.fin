@@ -24,19 +24,21 @@
 // Tests for zhttp. Run: finc -I ../src tests/test_lib.fin -o test_zhttp && ./test_zhttp
 import {
     HttpHeaders, HttpRequest, HttpResponse, HttpUrl, HttpUrlResult,
-    HttpResult, HttpReadResult, HttpServer, HttpConn,
-    http_parse_url, http_free_url_result,
-    http_status_text, http_new_headers, http_free_headers,
-    http_header_has, http_header_get, http_header_set,
-    http_header_count, http_header_name, http_header_value,
-    http_response, http_response_with_type, http_free_response, http_free_request,
-    http_free_read_result, http_free_result, http_get, http_post,
-    http_listen, http_server_port, http_accept, http_read_request,
-    http_write_response, http_write_raw, http_close, http_detach, http_server_close,
-    http_socket_dial, http_socket_close, http_socket_invalid, http_socket_read, HttpSocket
+      HttpResult, HttpReadResult, HttpServer, HttpConn,
+      http_parse_url, http_free_url_result,
+      http_status_text, http_new_headers, http_free_headers,
+      http_header_has, http_header_get, http_header_set,
+      http_header_count, http_header_name, http_header_value,
+      http_response, http_response_with_type, http_free_response, http_free_request,
+      http_free_read_result, http_free_result, http_get, http_post,
+      http_get_with_timeout, http_post_with_timeout,
+      http_listen, http_server_port, http_accept, http_read_request,
+      http_write_response, http_write_raw, http_close, http_detach, http_server_close,
+      http_socket_dial, http_socket_close, http_socket_invalid, http_socket_read,
+      http_socket_read_exact, http_socket_timeout, SocketBytes, HttpSocket
 } from zhttp::fin;
 import { assert_true, assert_eq_int, assert_eq_string } from testing::std;
-import { free_str, equals, len, clone } from strings::std;
+import { free_str, equals, len, clone, from_chars } from strings::std;
 import { Thread } from sync::std;
 
 #[llvm_name="getenv"]
@@ -54,9 +56,40 @@ fun protocol_driver(mode: string) <noret> {
         http_free_result(&r);
         return;
     }
+    if (equals(mode, "client_timeout")) {
+        let r2 <HttpResult> = http_get_with_timeout(t_getenv("ZHTTP_TEST_URL"), 250);
+        if (r2.ok) { printf("ACCEPT %d %d\n", r2.status, len(r2.body)); }
+        else { printf("REJECT: %s\n", r2.err); }
+        http_free_result(&r2);
+        return;
+    }
+    if (equals(mode, "client_inject")) {
+        // A redirect-free client still honours the URL it is given. The path
+        // carries CRLF, so a client that builds the request line from it
+        // would inject a header.
+        let r3 <HttpResult> = http_get_with_timeout(t_getenv("ZHTTP_TEST_URL"), 300);
+        if (r3.ok) { printf("ACCEPT %d %d\n", r3.status, len(r3.body)); }
+        else { printf("REJECT: %s\n", r3.err); }
+        http_free_result(&r3);
+        return;
+    }
     let fd <HttpSocket> = http_socket_dial("127.0.0.1", t_atoi(t_getenv("ZHTTP_TEST_PORT")));
     assert_true(fd != http_socket_invalid(), "protocol driver connects to the peer");
-    let conn <&HttpConn> = new HttpConn{fd: fd};
+    if (equals(mode, "exact")) {
+        let want <int> = 8;
+        let got <SocketBytes> = http_socket_read_exact(fd, want);
+        assert_true(got.ok, "http_socket_read_exact returns ok");
+        assert_eq_int(got.len, want, "http_socket_read_exact returns every byte");
+        let out <[char]> = new [char, 9]{};
+        for (let i <int> = 0; i < want; i++) { out[i] = got.data[i]; }
+        out[8] = cast<char>(0);
+        printf("%s\n", from_chars(out, 0, 8));
+        delete out;
+        delete got.data;
+        http_socket_close(fd);
+        return;
+    }
+    let conn <&HttpConn> = new HttpConn{fd: fd, served: false};
     if (equals(mode, "response")) {
         let resp <&HttpResponse> = http_response(204, "must not be sent");
         let ok <bool> = http_write_response(conn, resp);
@@ -84,6 +117,14 @@ fun protocol_driver(mode: string) <noret> {
     if (rr.ok) { printf("ACCEPT %d\n", len(rr.req.body)); }
     else { printf("REJECT\n"); }
     http_free_read_result(&rr);
+    if (equals(mode, "twice")) {
+        // The same connection, read again. No keep-alive, so the second read
+        // must refuse by name rather than parsing the leftover bytes.
+        let again <HttpReadResult> = http_read_request(conn);
+        if (again.ok) { printf("SECOND_ACCEPT\n"); }
+        else { printf("SECOND_REJECT: %s\n", again.err); }
+        http_free_read_result(&again);
+    }
     if (equals(mode, "upgrade")) {
         let fd <HttpSocket> = http_detach(conn);
         let bytes <[char]> = new [char, 4]{};
@@ -108,10 +149,10 @@ fun protocol_driver(mode: string) <noret> {
 // is captured, so the two sides see the same memory.
 struct Loopback {
     port <int>,
-    ok <bool>,
-    status <int>,
-    body <string>,
-    header_count <int>,
+      ok <bool>,
+      status <int>,
+      body <string>,
+      header_count <int>,
 }
 
 // Runs the client request on a worker thread while the main thread serves.
@@ -178,6 +219,16 @@ fun test_url_parsing() <noret> {
 
     r = http_parse_url("http:///path");
     assert_true(!r.ok, "url: missing host rejected");
+    http_free_url_result(&r);
+
+    // A host is written into the Host header, so a CR/LF there is a header
+    // injection and must fail at parse time, not at write time.
+    r = http_parse_url("http://127.0.0.1\r\nX-Injected: yes/");
+    assert_true(!r.ok, "url: CR in host rejected");
+    http_free_url_result(&r);
+
+    r = http_parse_url("http://127.0.0.1 /");
+    assert_true(!r.ok, "url: space in host rejected");
     http_free_url_result(&r);
 
     r = http_parse_url("http://10.0.0.5:1/a/b?x=1&y=2");
@@ -315,6 +366,29 @@ fun test_loopback_post_and_chunked() <noret> {
     printf("loopback POST + chunked: ok\n");
 }
 
+// The client refuses a request target or content type that would end the
+// request line or a header early. Without the guard, the bytes are written to
+// the wire verbatim and the peer sees a second header.
+fun test_injection_rejected() <noret> {
+    let r <HttpResult> = http_get("http://127.0.0.1:1/a\r\nX-Injected: yes");
+    assert_true(!r.ok, "injection: CRLF in path rejected");
+    http_free_result(&r);
+
+    let r2 <HttpResult> = http_get("http://127.0.0.1:1/a\nb");
+    assert_true(!r2.ok, "injection: LF in path rejected");
+    http_free_result(&r2);
+
+    let r3 <HttpResult> = http_get("http://127.0.0.1:1/a b");
+    assert_true(!r3.ok, "injection: space in path rejected");
+    http_free_result(&r3);
+
+    let r4 <HttpResult> = http_post("http://127.0.0.1:1/", "text/plain\r\nX: y", "body");
+    assert_true(!r4.ok, "injection: CRLF in content type rejected");
+    http_free_result(&r4);
+
+    printf("injection rejected: ok\n");
+}
+
 fun test_client_errors() <noret> {
     // Closed port on loopback: connect must fail cleanly and fast, not abort.
     let r <HttpResult> = http_get("http://127.0.0.1:1/");
@@ -340,6 +414,7 @@ fun main() <noret> {
     test_status_and_headers();
     test_loopback_get();
     test_loopback_post_and_chunked();
+    test_injection_rejected();
     test_client_errors();
     printf("zhttp: all tests passed\n");
 }

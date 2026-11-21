@@ -1,27 +1,4 @@
 #!/usr/bin/env python3
-# =============================================================================
-# Fin Programming Language
-#
-# Made with ❤️ for someone special.
-#
-# This project is genuinely built on love and dedication, a way to express your love can be done through Fin.
-# Fin is a semi-object-orientated programming language that specialized in control, giving so much control to the user while asking for the bare minimum.
-# Fin is the name of the Angel from BlackNightmare-Stories not yet published.
-# “Love is the reason this project exists”
-# -----------------------------------------------------------------------------
-# Author: M1778
-# Repository: https://github.com/M1778/zhttp
-# Profile: https://github.com/M1778M/
-# -----------------------------------------------------------------------------
-# Copyright (C) 2027 M1778
-#
-# This file is part of zhttp, a project for the Fin Programming Language.
-#
-# Licensed under the MIT License. See LICENSE in the repository root.
-#
-# SPDX-License-Identifier: MIT
-# =============================================================================
-
 """Install a pinned finc release without building the compiler from source.
 
 WHY THIS IS A SCRIPT AND NOT INLINE YAML
@@ -91,20 +68,6 @@ def host_triples() -> list[str]:
     sys.exit(1)
 
 
-def add_to_path(path: Path) -> None:
-    """Put `path` on PATH for the following steps.
-
-    The `::add-path::` workflow command this used to print was removed from
-    GitHub Actions; appending to $GITHUB_PATH is the supported mechanism, and
-    outside CI the file is absent so the print is a harmless note.
-    """
-    print(f"installed into {path}")
-    github_path = os.environ.get("GITHUB_PATH")
-    if github_path:
-        with open(github_path, "a", encoding="utf-8") as handle:
-            handle.write(f"{path}\n")
-
-
 def fetch(url: str) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": "fin-ci-installer"})
     with urllib.request.urlopen(req, timeout=60) as resp:
@@ -118,6 +81,26 @@ def unpack(archive: Path, dest: Path) -> None:
     else:
         with tarfile.open(archive) as tf:
             tf.extractall(dest)
+
+
+def emit_path(bin_dir: Path) -> None:
+    """Tell the caller where the compiler went, in the form each context reads.
+
+    `::add-path::` is a GitHub Actions workflow command that was retired years ago: it is no
+    longer honoured, and it is no longer even a known command, so printing it into `$GITHUB_ENV`
+    -- which is what a bare `print` in a step does -- puts a line in that file with no `NAME=VALUE`
+    in it and fails the step. Three repositories hit that and worked around it locally.
+
+    When `GITHUB_PATH` is set, append the directory to it, which is the current mechanism.
+    Otherwise print the directory for a human or a shell to use.
+    """
+    target = os.environ.get("GITHUB_PATH")
+    if target:
+        with open(target, "a", encoding="utf-8") as fh:
+            fh.write(str(bin_dir) + "\n")
+        print(f"added {bin_dir} to $GITHUB_PATH")
+    else:
+        print(str(bin_dir))
 
 
 def main() -> int:
@@ -148,7 +131,7 @@ def main() -> int:
         )
         if out.returncode == 0:
             print(f"finc already installed: {out.stdout.strip()}")
-            add_to_path(dest / "bin")
+            emit_path(dest / "bin")
             return 0
         print("cached finc does not answer --version; reinstalling", file=sys.stderr)
 
@@ -254,8 +237,7 @@ def main() -> int:
         )
         return 1
 
-    # GitHub Actions picks this up; harmless elsewhere.
-    add_to_path(dest / "bin")
+    emit_path(dest / "bin")
     return 0
 
 

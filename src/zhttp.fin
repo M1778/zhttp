@@ -140,7 +140,12 @@ fun z_interrupted() <bool> {
 // different handling, and a server cannot tell them apart from a recv result.
 fun z_would_block() <bool> {
     #c_ifdef FIN_TARGET_WINDOWS
-    return z_last_error() == 10035; // WSAEWOULDBLOCK: what a Winsock timeout reports.
+    // A blocking Winsock socket whose SO_RCVTIMEO expires fails with
+    // WSAETIMEDOUT (10060). WSAEWOULDBLOCK (10035) is the non-blocking
+    // equivalent and is accepted too, so either shape is reported as a
+    // deadline rather than as an unreadable response.
+    let werr <int> = z_last_error();
+    return werr == 10060 || werr == 10035;
     #c_else
     // EAGAIN and EWOULDBLOCK are 11 on Linux and 35 on Darwin; each platform
     // defines both names, so naming the pair covers the SO_RCVTIMEO result.

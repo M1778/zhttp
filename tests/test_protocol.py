@@ -76,9 +76,27 @@ def check(process, expected, label):
         process.communicate()
         raise AssertionError(f"{label}: blocked after complete framed message")
     assert process.returncode == 0, (label, process.returncode, err.decode())
-    assert out.decode().strip() == expected, (label, out.decode(), expected)
+    output = out.decode("utf-8")
+    # Only driver console lines are normalized; wire payload checks stay
+    # byte-exact. The native Windows driver prints CRLF, so a multi-line
+    # ACCEPT/TAIL comparison needs this and a single-line one does not.
+    if os.name == "nt":
+        output = output.replace("\r\n", "\n")
+    assert output.strip() == expected, (label, output, expected)
     COUNT += 1
     print(f"PASS {label}")
+
+
+def console(process_output):
+    """The driver's stdout as comparable text.
+
+    The native Windows driver prints CRLF. Normalizing it here affects only the
+    driver's own console lines; every HTTP byte assertion below stays exact.
+    """
+    text = process_output.decode("utf-8")
+    if os.name == "nt":
+        text = text.replace("\r\n", "\n")
+    return text.strip()
 
 
 def launch_url(mode, listener, path):
@@ -321,7 +339,7 @@ for label, path in [
         p, _ = launch_url("client_inject", listener, path)
         out, err = p.communicate(timeout=8)
         assert p.returncode == 0, (label, p.returncode, err.decode())
-        text = out.decode().strip()
+        text = console(out)
         assert text.startswith("REJECT"), (label, text)
         assert "refusing" in text, (label, text)
         try:
@@ -355,7 +373,7 @@ try:
         started = time.monotonic()
         out, err = p.communicate(timeout=8)
         elapsed = time.monotonic() - started
-    text = out.decode().strip()
+    text = console(out)
     assert p.returncode == 0, (p.returncode, err.decode())
     assert text.startswith("REJECT") and "timed out" in text, text
     # The requested deadline is 250 ms; allow scheduling slack but prove the
@@ -399,7 +417,7 @@ try:
         peer.sendall(b"EFGH")
     out, err = p.communicate(timeout=8)
     assert p.returncode == 0, (p.returncode, err.decode())
-    assert out.decode().strip() == "ABCDEFGH", out.decode()
+    assert console(out) == "ABCDEFGH", out.decode()
     COUNT += 1
     print("PASS http_socket_read_exact assembles fragmented reads")
 finally:

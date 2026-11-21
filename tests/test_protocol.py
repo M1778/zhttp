@@ -409,7 +409,10 @@ try:
         # recv, so the first fragment cannot arrive before the read starts. That
         # makes the split deterministic instead of a pair of sleeps that could
         # silently coalesce into one segment and never test a partial read.
-        assert p.stdout.readline() == b"READY\n", "driver did not announce readiness"
+        ready = p.stdout.readline()
+        # The native Windows driver terminates console lines with CRLF.
+        assert ready.replace(b"\r\n", b"\n") == b"READY\n", (
+            f"driver did not announce readiness: {ready!r}")
         peer.sendall(b"ABCD")
         # Wait for the driver to have consumed it before sending the rest, so
         # the two writes cannot merge in the receive buffer.

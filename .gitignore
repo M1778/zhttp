@@ -1,7 +1,13 @@
 .finn/
+.finn-bin/
+.finc/
 out/
 *.o
+*.obj
 *.exe
 test_zhttp
+test_zhttp_o2
+zhttp_server
+zhttp_client
 server_example
 client_example

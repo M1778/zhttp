@@ -2,10 +2,9 @@ name: CI
 
 # The compiler comes from a pinned published release, not from a source build.
 #
-# This used to clone M1778/Fin and run ./build.sh, which cost twenty minutes per job and
-# needed Conan, CMake, Flex, Bison and LLVM 22 on every runner. It also tested whatever the
-# compiler's master happened to be at the time, so a red run could not be attributed without
-# reading a second repository.
+# Building finc costs twenty minutes per job and needs Conan, CMake, Flex, Bison and LLVM on
+# every runner, and it tests whatever the compiler's master happened to be at the time, so a
+# red run cannot be attributed without reading a second repository.
 #
 # FINC_VERSION pins it; .github/scripts/install_finc.py verifies the archive's sha256 against
 # the release index before unpacking. On Linux it takes the static musl build, which needs no
@@ -13,21 +12,39 @@ name: CI
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, production/hardening]
   pull_request:
 
 permissions:
   contents: read
 
+env:
+  # One pin for the whole workflow, read by .github/scripts/install_finc.py.
+  # The "Install the pinned finc" step asserts this agrees with the FINC_VERSION file.
+  FINC_VERSION: "1.0.0"
+
 jobs:
   test:
-    name: ${{ matrix.os }}
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       # One platform's failure must not cancel the others.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+            # Linux can interpose send/recv/accept through LD_PRELOAD; macOS and Windows
+            # have no equivalent. tests/test_protocol.py prints SKIP with the reason on
+            # those two rather than dropping the case silently.
+            shim: "yes"
+          - name: macos-arm64
+            os: macos-14
+            shim: "no"
+          - name: windows-x86_64
+            os: windows-2022
+            shim: "no"
     steps:
       - uses: actions/checkout@v7
 
@@ -35,19 +52,45 @@ jobs:
         with:
           python-version: '3.12'
 
+      # The published macOS finc links /opt/homebrew/opt/llvm@22/lib/libLLVM.dylib by
+      # absolute path, so the keg has to exist or the binary does not start. Linux uses
+      # the static musl archive and Windows ships a self-contained .exe.
+      - name: Install the LLVM runtime (macOS only)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: brew install llvm@22
+
       - name: Install the pinned finc
         shell: bash
-        run: python .github/scripts/install_finc.py --dest "$RUNNER_TEMP/finc"
+        run: |
+          pinned="$(tr -d '[:space:]' < FINC_VERSION)"
+          if [ "$pinned" != "$FINC_VERSION" ]; then
+            echo "::error::FINC_VERSION file says '$pinned' but the workflow says '$FINC_VERSION'"
+            exit 1
+          fi
+          python .github/scripts/install_finc.py --dest "$RUNNER_TEMP/finc"
 
-      - name: Put finc on PATH
+      - name: Put finc on PATH and prove the contract version
         shell: bash
         run: |
           echo "$RUNNER_TEMP/finc/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/finc/bin/finc" --version
+          "$RUNNER_TEMP/finc/bin/finc" --version | grep -q "contract 3" || {
+            echo "::error::the pinned finc does not answer contract 3"
+            exit 1
+          }
+
+      - name: Install finn
+        shell: bash
+        run: python .github/scripts/install_finn.py --dest "$RUNNER_TEMP/finn"
+
+      - name: Put finn on PATH
+        shell: bash
+        run: echo "$RUNNER_TEMP/finn" >> "$GITHUB_PATH"
 
       - name: Type-check the library
         shell: bash
-        run: finc src/zhttp.fin
+        run: finc -I src src/zhttp.fin
 
       # The tests are real traffic: a loopback server answers GET, POST and chunked requests,
       # and the error paths are exercised. The timeout is not decoration -- a server test that
@@ -58,9 +101,68 @@ jobs:
         run: |
           finc tests/test_lib.fin -I src -o "$RUNNER_TEMP/test_lib"
           "$RUNNER_TEMP/test_lib"
+          "$RUNNER_TEMP/test_lib" | grep -q "zhttp: all tests passed"
+
+      - name: Build and run the same tests at -O2
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          finc -O2 tests/test_lib.fin -I src -o "$RUNNER_TEMP/test_lib_o2"
+          "$RUNNER_TEMP/test_lib_o2"
+
+      # Malformed framing, exact limits, truncated bodies, a silent peer and a second read
+      # on one connection. These are the cases a type-check cannot see.
+      - name: Adversarial protocol suite
+        shell: bash
+        timeout-minutes: 10
+        run: python -I tests/test_protocol.py "$RUNNER_TEMP/test_lib"
 
       - name: Compile the examples
         shell: bash
         run: |
           finc examples/client.fin -I src -o "$RUNNER_TEMP/ex_client"
           finc examples/server.fin -I src -o "$RUNNER_TEMP/ex_server"
+
+      # The package is only usable if finn can resolve it, and a broken layout is invisible
+      # to `finc -I src`. This builds a throwaway consumer and imports zhttp::fin the way
+      # the README documents.
+      - name: The package resolves through finn
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          mkdir -p "$tmp/src"
+          here="$(pwd)"
+          # Windows paths use backslashes; TOML needs them escaped. Forward slashes are
+          # accepted by the Win32 API, so normalise instead.
+          here="${here//\\//}"
+          cat > "$tmp/finn.toml" <<EOF
+          [project]
+          name = "consumer"
+          version = "0.1.0"
+          envpath = ".finn"
+          entrypoint = "main.fin"
+
+          [packages]
+          zhttp = "$here"
+
+          [scripts]
+          EOF
+          cat > "$tmp/src/main.fin" <<'EOF'
+          import { HttpResponse, http_response, http_free_response, http_status_text } from zhttp::fin;
+          fun main() <noret> {
+              let r <&HttpResponse> = http_response(201, "made");
+              printf("%s %d %s\n", http_status_text(201), r.status, r.body);
+              http_free_response(r);
+          }
+          EOF
+          ( cd "$tmp" && FIN_COMPILER_PATH="$(command -v finc)" finn sync \
+                        && FIN_COMPILER_PATH="$(command -v finc)" finn build )
+          out="$tmp/out/consumer"
+          [ -f "$out" ] || out="$tmp/out/consumer.exe"
+          "$out" | grep -q "Created 201 made"
+
+      - name: Header discipline
+        shell: bash
+        run: python scripts/fin_header.py --repo zhttp --license MIT --check src tests examples zhttp.fin scripts .github/scripts

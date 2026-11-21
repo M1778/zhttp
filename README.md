@@ -3,9 +3,14 @@
 HTTP/1.1 client and server for [Fin](https://github.com/M1778/Fin). Built on raw
 blocking TCP over IPv4 (the same design as `networking::std`).
 
-> **Verification status:** ✅ VERIFIED — built with `finc 0.4.0` (contract 3);
-> full test suite passes, including real loopback client/server tests (GET, POST
-> echo, chunked decoding). CI also builds finc from source and re-runs everything.
+> **Verification status:** ✅ VERIFIED — built with `finc 1.0.0` (contract 3);
+> the Fin test suite passes, including real loopback client/server tests (GET, POST
+> echo, chunked decoding).
+>
+> The Python peer suite in `tests/test_protocol.py` (326 lines of adversarial
+> request/response cases) is **not** run by CI today; it is a local tool. CI runs the Fin
+> suite and compiles both examples. That distinction is stated because "CI re-runs
+> everything" was previously claimed here and was not true.
 
 ## Install
 

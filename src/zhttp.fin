@@ -155,11 +155,24 @@ fun z_would_block() <bool> {
 // nonsensical value, so 0 means "no deadline" here rather than "block
 // forever" being silently assumed.
 //
-// SOL_SOCKET differs by target: 1 on Linux, 0xffff on Darwin and Winsock.
+// Both level and option number differ by target, and neither is the same on
+// Linux as on Darwin and Winsock:
+//
+//              SOL_SOCKET  SO_RCVTIMEO  SO_SNDTIMEO
+//   Linux           1           20           21
+//   Darwin      0xffff       0x1006       0x1005
+//   Winsock     0xffff       0x1006       0x1005
+//
+// Using Linux's 20/21 on Darwin asks for an unrelated option and the call
+// fails, which is a deadline that silently does not exist.
 #c_ifdef FIN_TARGET_LINUX
 fun z_sol_socket() <int> { return 1; }
+fun z_recv_timeout_option() <int> { return 20; }
+fun z_send_timeout_option() <int> { return 21; }
 #c_else
 fun z_sol_socket() <int> { return 65535; }
+fun z_recv_timeout_option() <int> { return 4102; }  // SO_RCVTIMEO
+fun z_send_timeout_option() <int> { return 4101; }  // SO_SNDTIMEO
 #c_endif
 
 fun z_set_socket_timeout(fd: HttpSocket, option: int, ms: int) <bool> {
@@ -235,8 +248,8 @@ fun z_default_timeout_ms() <int> { return 30000; }
 pub fun http_socket_timeout(fd: HttpSocket, ms: int) <bool> {
     if (ms == 0) { return true; } // No deadline, asked for deliberately.
     blame ms > 0, "http_socket_timeout: milliseconds cannot be negative";
-    // SO_RCVTIMEO is 20 and SO_SNDTIMEO is 21 in Winsock and on Linux/Darwin.
-    return z_set_socket_timeout(fd, 20, ms) && z_set_socket_timeout(fd, 21, ms);
+    return z_set_socket_timeout(fd, z_recv_timeout_option(), ms) &&
+      z_set_socket_timeout(fd, z_send_timeout_option(), ms);
 }
 
 // How a read ended, so a deadline is not reported as a truncation. A peer that

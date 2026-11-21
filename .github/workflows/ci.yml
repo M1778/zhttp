@@ -45,6 +45,18 @@ jobs:
           - name: windows-x86_64
             os: windows-2022
             shim: "no"
+    env:
+      # `finc` appends a link line meant for its own object, which calls the
+      # LLVM C API, so the default is `-lLLVM-<major>`: a dependency on a
+      # library this repository's programs never reference. Verified with
+      # `nm -u` on the test object: zero LLVM symbols. Requiring the library
+      # would force every runner to install a matching LLVM, including the
+      # macOS keg that default looks for.
+      #
+      # MSVC has no separate libm -- the CRT supplies it -- and `-lm` becomes a
+      # request for m.lib, which does not exist, so Windows leaves it empty and
+      # finc falls back to its own -lws2_32 default.
+      FIN_LDFLAGS: ${{ runner.os == 'Windows' && '' || '-lm' }}
     steps:
       - uses: actions/checkout@v7
 

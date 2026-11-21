@@ -387,9 +387,15 @@ try:
     p = launch("exact", port=port)
     peer, _ = listener.accept()
     with peer:
-        time.sleep(0.05)
+        # "READY" is printed and flushed by the driver just before it blocks in
+        # recv, so the first fragment cannot arrive before the read starts. That
+        # makes the split deterministic instead of a pair of sleeps that could
+        # silently coalesce into one segment and never test a partial read.
+        assert p.stdout.readline() == b"READY\n", "driver did not announce readiness"
         peer.sendall(b"ABCD")
-        time.sleep(0.15)
+        # Wait for the driver to have consumed it before sending the rest, so
+        # the two writes cannot merge in the receive buffer.
+        time.sleep(0.2)
         peer.sendall(b"EFGH")
     out, err = p.communicate(timeout=8)
     assert p.returncode == 0, (p.returncode, err.decode())

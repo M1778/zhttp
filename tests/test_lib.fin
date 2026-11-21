@@ -46,6 +46,9 @@ import { Thread } from sync::std;
 #[llvm_name="atoi"]
 @define t_atoi(text: string) <int>;
 
+#[llvm_name="fflush"]
+@define t_fflush(stream: &void) <int>;
+
 // Public-API driver for test_protocol.py's adversarial TCP/socketpair peers.
 // The ordinary test entry point remains unchanged when ZHTTP_TEST_MODE is absent.
 fun protocol_driver(mode: string) <noret> {
@@ -76,6 +79,12 @@ fun protocol_driver(mode: string) <noret> {
     let fd <HttpSocket> = http_socket_dial("127.0.0.1", t_atoi(t_getenv("ZHTTP_TEST_PORT")));
     assert_true(fd != http_socket_invalid(), "protocol driver connects to the peer");
     if (equals(mode, "exact")) {
+        // Announce readiness and flush, so the peer below sends the first
+        // fragment only once this process is actually blocked in recv. Without
+        // it the two fragments can arrive coalesced in one segment and the
+        // test would pass while never exercising a partial read.
+        printf("READY\n");
+        t_fflush(null);
         let want <int> = 8;
         let got <SocketBytes> = http_socket_read_exact(fd, want);
         assert_true(got.ok, "http_socket_read_exact returns ok");

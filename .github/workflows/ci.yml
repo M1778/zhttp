@@ -138,46 +138,14 @@ jobs:
           finc examples/client.fin -I src -o "$RUNNER_TEMP/ex_client"
           finc examples/server.fin -I src -o "$RUNNER_TEMP/ex_server"
 
-      # The package is only usable if finn can resolve it, and a broken layout is invisible
-      # to `finc -I src`. This builds a throwaway consumer and imports zhttp::fin the way
-      # the README documents.
+      # The package is only usable if finn can resolve it, and a broken layout is
+      # invisible to `finc -I src`. The script writes a manifest pointing at this
+      # checkout, syncs, builds, and runs the consumer.
       - name: The package resolves through finn
         shell: bash
         timeout-minutes: 10
-        run: |
-          set -euo pipefail
-          tmp="$(mktemp -d)"
-          mkdir -p "$tmp/src"
-          here="$(pwd)"
-          # Windows paths use backslashes; TOML needs them escaped. Forward slashes are
-          # accepted by the Win32 API, so normalise instead.
-          here="${here//\\//}"
-          cat > "$tmp/finn.toml" <<EOF
-          [project]
-          name = "consumer"
-          version = "0.1.0"
-          envpath = ".finn"
-          entrypoint = "main.fin"
-
-          [packages]
-          zhttp = "$here"
-
-          [scripts]
-          EOF
-          cat > "$tmp/src/main.fin" <<'EOF'
-          import { HttpResponse, http_response, http_free_response, http_status_text } from zhttp::fin;
-          fun main() <noret> {
-              let r <&HttpResponse> = http_response(201, "made");
-              printf("%s %d %s\n", http_status_text(201), r.status, r.body);
-              http_free_response(r);
-          }
-          EOF
-          ( cd "$tmp" && FIN_COMPILER_PATH="$(command -v finc)" finn sync \
-                        && FIN_COMPILER_PATH="$(command -v finc)" finn build )
-          out="$tmp/out/consumer"
-          [ -f "$out" ] || out="$tmp/out/consumer.exe"
-          "$out" | grep -q "Created 201 made"
+        run: python .github/scripts/check_package.py
 
       - name: Header discipline
         shell: bash
-        run: python scripts/fin_header.py --repo zhttp --license MIT --check src tests examples zhttp.fin scripts .github/scripts
+        run: python scripts/fin_header.py --repo zhttp --license MIT --check src tests examples zhttp.fin scripts .github/scripts .github/consumer

@@ -79,10 +79,6 @@ type ZAddrLen = uint;
 @define z_setsockopt_timeval(fd: HttpSocket, level: int, option: int, value: &long, size: uint) <int>;
 #[llvm_name="setsockopt"]
 @define z_setsockopt_msec(fd: HttpSocket, level: int, option: int, value: &int, size: uint) <int>;
-#[llvm_name="clock_gettime"]
-@define z_clock_gettime(id: int, ts: &long) <int>;
-#[llvm_name="GetTickCount64"]
-@define z_tick_count() <ulong>;
 
 #[llvm_name="socket"]
 @define z_socket(domain: int, kind: int, protocol: int) <HttpSocket>;
@@ -146,32 +142,13 @@ fun z_would_block() <bool> {
     #c_ifdef FIN_TARGET_WINDOWS
     return z_last_error() == 10035; // WSAEWOULDBLOCK: what a Winsock timeout reports.
     #c_else
+    // EAGAIN and EWOULDBLOCK are 11 on Linux and 35 on Darwin; each platform
+    // defines both names, so naming the pair covers the SO_RCVTIMEO result.
+    // errno 100 is ENETDOWN on Linux and must not be read as a timeout.
     let e <int> = *z_errno();
-    return e == 11 || e == 35 || e == 100; // EAGAIN/EWOULDBLOCK on Linux and Darwin, EINPROGRESS
+    return e == 11 || e == 35;
     #c_endif
 }
-
-// Wall clock for deadlines and socket options. Millisecond resolution is all a
-// request timeout needs, and 32-bit `time_t` platforms cannot overflow it.
-// Linux and Darwin have their monotonic clock at different ids, so the target
-// selector names each rather than assuming one; Windows has GetTickCount64.
-#c_ifdef FIN_TARGET_WINDOWS
-fun z_now_ms() <long> { return cast<long>(z_tick_count()); }
-#c_else
-#c_ifdef FIN_TARGET_DARWIN
-fun z_clock_id() <int> { return 6; } // CLOCK_MONOTONIC on Darwin
-#c_else
-fun z_clock_id() <int> { return 1; } // CLOCK_MONOTONIC on Linux
-#c_endif
-fun z_now_ms() <long> {
-    let ts <[long]> = new [long, 2]{};
-    let rc <int> = z_clock_gettime(z_clock_id(), &ts[0]);
-    let t <long> = ts[0] * cast<long>(1000) + ts[1] / cast<long>(1000000);
-    delete ts;
-    if (rc != 0) { return 0; }
-    return t;
-}
-#c_endif
 
 // SO_RCVTIMEO / SO_SNDTIMEO take a struct timeval on POSIX and a DWORD of
 // milliseconds on Winsock. Either way the kernel refuses the call for a
